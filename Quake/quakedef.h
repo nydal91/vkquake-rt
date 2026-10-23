@@ -253,6 +253,7 @@ typedef enum
 	CANVAS_CSQC,
 	CANVAS_SBAR_MINIMAL_BOTTOMLEFT,
 	CANVAS_SBAR_MINIMAL_BOTTOMRIGHT,
+	CANVAS_TOUCH, // Android touch controls: 240 units high, full screen
 	CANVAS_INVALID = -1
 } canvastype;
 

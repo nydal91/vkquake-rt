@@ -24,6 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // screen.c -- master for refresh, status bar, console, chat, notify, etc
 
 #include "quakedef.h"
+#include "android_touch.h"
 
 #include "cfgfile.h"
 
@@ -1031,6 +1032,9 @@ static void SCR_DrawGUI (void *unused)
 		SCR_DrawConsole (cbx);
 		M_Draw (cbx);
 	}
+#ifdef HAVE_TOUCH_CONTROLS
+	AndroidTouch_Draw (cbx);
+#endif
 	R_EndDebugUtilsLabel (cbx);
 }
 

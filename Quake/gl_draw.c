@@ -1140,6 +1140,10 @@ void GL_SetCanvas (cb_context_t *cbx, canvastype newcanvas)
 		GL_OrthoMatrix (cbx, 0, 320, 200, 0, -99999, 99999);
 		GL_Viewport (cbx, glx + glwidth - 320 * s, gly + glheight - 200 * s, 320 * s, 200 * s, 0.0f, 1.0f);
 		break;
+	case CANVAS_TOUCH:
+		GL_OrthoMatrix (cbx, 0, 240.0f * glwidth / q_max (glheight, 1), 240, 0, -99999, 99999);
+		GL_Viewport (cbx, glx, gly, glwidth, glheight, 0.0f, 1.0f);
+		break;
 	default:
 		Sys_Error ("GL_SetCanvas: bad canvas type");
 	}

@@ -24,6 +24,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // gl_vidsdl.c -- SDL vid component
 
 #include "quakedef.h"
+#ifndef _WIN32
+#include "rt_vkdriver.h"
+#endif
 extern int qrt_test_frames, qrt_test_frame; // main_sdl.c
 #include "cfgfile.h"
 #include "bgmusic.h"
@@ -575,9 +578,12 @@ void VID_Lock (void)
 //
 //==============================================================================
 
+static char rt_last_message[1024] = "";
+
 static void RT_PrintMessage (const char *pMessage, void *pUserData)
 {
-	Con_Warning (pMessage);
+	q_strlcpy (rt_last_message, pMessage, sizeof (rt_last_message));
+	Con_Warning ("%s", pMessage);
 }
 
 static void RT_ReloadShaders (void)
@@ -640,6 +646,8 @@ static void GL_InitInstance (void)
 	RgWin32SurfaceCreateInfo win32Info = {.hinstance = wmInfo.info.win.hinstance, .hwnd = wmInfo.info.win.window};
 #elif defined(RG_USE_SURFACE_XLIB)
 	RgXlibSurfaceCreateInfo x11Info = {.dpy = wmInfo.info.x11.display, .window = wmInfo.info.x11.window};
+#elif defined(RG_USE_SURFACE_ANDROID)
+	RgAndroidSurfaceCreateInfo androidInfo = {.window = wmInfo.info.android.window};
 #endif
 
 	const char pShaderPath[] = RT_OVERRIDEN_FOLDER "shaders/";
@@ -654,6 +662,12 @@ static void GL_InitInstance (void)
 		.pWin32SurfaceInfo = &win32Info,
 #elif defined(RG_USE_SURFACE_XLIB)
 		.pXlibSurfaceCreateInfo = &x11Info,
+#elif defined(RG_USE_SURFACE_ANDROID)
+		.pAndroidSurfaceCreateInfo = &androidInfo,
+#endif
+#ifndef _WIN32
+		// a custom GPU driver chosen in the launcher (e.g. Mesa Turnip), or NULL
+		.pfnVulkanGetInstanceProcAddr = RT_LoadCustomVulkanDriver (),
 #endif
 		
 		.pfnPrint = RT_PrintMessage,
@@ -692,6 +706,12 @@ static void GL_InitInstance (void)
 	};
 
 	RgResult r = rgCreateInstance (&info, &vulkan_globals.instance);
+#ifndef _WIN32
+	RT_LogVulkanDriverFiles ();
+	if (r != RG_SUCCESS)
+		Sys_Error ("Couldn't start the ray tracing renderer: %s\n\nGPU driver: %s\n\n%s", rgGetResultDescription (r), RT_CustomVulkanDriverDesc (),
+		           rt_last_message);
+#endif
 	RG_CHECK (r);
 
 
@@ -723,8 +743,40 @@ static void GL_InitInstance (void)
 GL_BeginRenderingTask
 =================
 */
+#ifdef __ANDROID__
+static volatile qboolean android_window_changed = false;
+
+// the app came back from the background with a new surface
+void VID_AndroidWindowChanged (void)
+{
+	android_window_changed = true;
+}
+
+static void ApplyAndroidWindowChange (void)
+{
+	SDL_SysWMinfo wmInfo;
+
+	if (!android_window_changed || !vulkan_globals.instance)
+		return;
+	android_window_changed = false;
+
+	SDL_VERSION (&wmInfo.version);
+	if (!SDL_GetWindowWMInfo (draw_context, &wmInfo) || wmInfo.info.android.window == NULL)
+	{
+		Sys_Printf ("RT: no Android window to recreate the surface with\n");
+		return;
+	}
+	RgResult r = rgSetAndroidWindow (vulkan_globals.instance, wmInfo.info.android.window);
+	if (r != RG_SUCCESS)
+		Sys_Error ("Can't recreate the ray tracing surface: %s\n\n%s", rgGetResultDescription (r), rt_last_message);
+}
+#endif
+
 void GL_BeginRenderingTask (void *unused)
 {
+#ifdef __ANDROID__
+	ApplyAndroidWindowChange ();
+#endif
 	RgStartFrameInfo info = {
 		.requestVSync = CVAR_TO_BOOL (vid_vsync),
 		.requestShaderReload = request_shaders_reload,

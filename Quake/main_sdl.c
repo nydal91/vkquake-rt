@@ -22,6 +22,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "quakedef.h"
+#include "android_sys.h"
+#include "android_touch.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -70,6 +72,12 @@ int main (int argc, char *argv[])
 
 	isDedicated = (COM_CheckParm ("-dedicated") != 0);
 
+#ifdef __ANDROID__
+	Android_Startup ();
+#endif
+#ifdef HAVE_TOUCH_CONTROLS
+	AndroidTouch_Init (); // sets hints, must be before SDL_Init
+#endif
 	Sys_InitSDL ();
 
 	Sys_Init ();
