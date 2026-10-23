@@ -100,6 +100,20 @@ cvar_t                          r_usesops = {"r_usesops", "1", CVAR_ARCHIVE};   
 task_handle_t prev_end_rendering_task = INVALID_TASK_HANDLE;
 
 // RT
+// phones: AMD CAS sharpening by default, as the upscale is linear (no FSR2 there)
+#ifdef __ANDROID__
+#define RT_SHARPEN_DEFAULT "2"
+#else
+#define RT_SHARPEN_DEFAULT "0"
+#endif
+// without FSR2's libraries (Linux, Android), its menu entry picks the render
+// resolution, upscaled linearly (see RTGL1's RenderResolutionHelper)
+#ifdef _WIN32
+#define RT_FSR2_IS_LINEAR 0
+#else
+#define RT_FSR2_IS_LINEAR 1
+#endif
+
 #define CVAR_DEF_LIST( CVAR_DEF_T ) \
 	\
 	CVAR_DEF_T (rt_classic_render, "0") \
@@ -178,7 +192,7 @@ task_handle_t prev_end_rendering_task = INVALID_TASK_HANDLE;
 	\
 	CVAR_DEF_T (rt_portal_twirl, "1") \
     \
-	CVAR_DEF_T (rt_sharpen, "0") \
+	CVAR_DEF_T (rt_sharpen, RT_SHARPEN_DEFAULT) \
 	CVAR_DEF_T (rt_renderscale, "0") \
 	CVAR_DEF_T (rt_vintage, "0") \
 	CVAR_DEF_T (rt_upscale_fsr2, "2") \
@@ -951,6 +965,11 @@ static void UpscaleCvarsToRtgl (RgDrawFrameRenderResolutionParams *pDst)
 
 static const char *GetUpscalerOptionName (int i, RgRenderUpscaleTechnique technique)
 {
+	if (RT_FSR2_IS_LINEAR && technique == RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2)
+	{
+		static const char *names[] = {"100%", "67%", "58%", "50%", "33%"};
+		return names[CLAMP (0, i, 4)];
+	}
 	if (!rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, technique))
 	{
 		return "Not Available";
@@ -2059,7 +2078,7 @@ static void VID_Menu_ChooseNextRate (int dir)
 
 static void VID_Menu_ChooseNextAA (int vidopt, int dir)
 {
-	RgBool32 fsr2_ok = rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2);
+	RgBool32 fsr2_ok = RT_FSR2_IS_LINEAR || rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2);
 	RgBool32 dlss_ok = rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS);
 
 	const int prev_fsr2 = menu_settings.rt_upscale_fsr2;
@@ -2351,7 +2370,7 @@ static void VID_MenuDraw (cb_context_t *cbx)
 		case VID_OPT_FSR2:
 			y += 8; // separate
 
-			M_Print (cbx, 16, y, "       AMD FSR 2.0");
+			M_Print (cbx, 16, y, RT_FSR2_IS_LINEAR ? " Render resolution" : "       AMD FSR 2.0");
 			M_Print (cbx, 184, y, GetUpscalerOptionName (menu_settings.rt_upscale_fsr2, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2));
 			break;
 		case VID_OPT_DLSS:
