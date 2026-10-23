@@ -24,6 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // gl_vidsdl.c -- SDL vid component
 
 #include "quakedef.h"
+extern int qrt_test_frames, qrt_test_frame; // main_sdl.c
 #include "cfgfile.h"
 #include "bgmusic.h"
 #include "resource.h"
@@ -1228,7 +1229,7 @@ static void GL_EndRenderingTask (end_rendering_parms_t *parms)
 		.rayCullMaskWorld = RG_DRAW_FRAME_RAY_CULL_WORLD_0_BIT | RG_DRAW_FRAME_RAY_CULL_WORLD_1_BIT | RG_DRAW_FRAME_RAY_CULL_SKY_BIT,
 		.disableRayTracedGeometry = false,
 		.disableRasterization = false,
-		.currentTime = (double)SDL_GetTicks () / 1000.0,
+		.currentTime = qrt_test_frames > 0 ? qrt_test_frame / 30.0 : (double)SDL_GetTicks () / 1000.0,
 		.disableEyeAdaptation = false,
 		.forceAntiFirefly = CVAR_TO_BOOL (rt_antifirefly),
 		.pRenderResolutionParams = &resolution_params,

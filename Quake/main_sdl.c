@@ -22,6 +22,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "quakedef.h"
+#include <stdlib.h>
 #include <stdio.h>
 
 static void Sys_AtExit (void)
@@ -50,6 +51,8 @@ static void Sys_InitSDL (void)
 }
 
 static quakeparms_t parms;
+
+int qrt_test_frames = 0, qrt_test_frame = 0;
 
 int main (int argc, char *argv[])
 {
@@ -81,6 +84,9 @@ int main (int argc, char *argv[])
 #else
 	Sys_Printf ("Built with unknown compiler\n");
 #endif
+
+	if (getenv ("QRT_TEST_FRAMES"))
+		qrt_test_frames = atoi (getenv ("QRT_TEST_FRAMES"));
 
 	Sys_Printf ("Host_Init\n");
 	Host_Init ();
@@ -117,6 +123,26 @@ int main (int argc, char *argv[])
 				SDL_Delay (32);
 			newtime = Sys_DoubleTime ();
 			time = newtime - oldtime;
+
+			// renderer tests: QRT_TEST_FRAMES=N renders N frames with a fixed 1/30 s
+			// step (also for the ray tracer's clock), then stops for a screenshot
+			if (qrt_test_frames > 0)
+			{
+				if (qrt_test_frame >= qrt_test_frames)
+				{
+					static qboolean announced = false;
+					if (!announced)
+					{
+						announced = true;
+						Sys_Printf ("QRT_TEST: frozen at frame %d\n", qrt_test_frame);
+						fflush (stderr);
+					}
+					SDL_Delay (100);
+					continue;
+				}
+				time = 1.0 / 30.0;
+				qrt_test_frame++;
+			}
 
 			Host_Frame (time);
 
