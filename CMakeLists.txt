@@ -142,4 +142,7 @@ if(QUAKE_TOUCH_TEST)
 endif()
 
 target_compile_options(${TARGET} PRIVATE -std=gnu11 -Wno-trigraphs -Wno-unused-function)
-target_link_libraries(${TARGET} PRIVATE "${RTGL1_LIBRARY}" ${SDL2_LIBRARIES} m pthread dl)
+target_link_libraries(${TARGET} PRIVATE "${RTGL1_LIBRARY}" ${SDL2_LIBRARIES} m dl)
+if(NOT ANDROID)
+    target_link_libraries(${TARGET} PRIVATE pthread)
+endif()

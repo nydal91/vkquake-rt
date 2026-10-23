@@ -295,7 +295,11 @@ static inline int FindFirstBitNonZero (const uint32_t mask)
 
 #ifdef _WIN32
     #define RG_USE_SURFACE_WIN32
-#else
+#elif defined(__ANDROID__)
+    #ifndef RG_USE_SURFACE_ANDROID
+    #define RG_USE_SURFACE_ANDROID
+    #endif
+#elif !defined(RG_USE_SURFACE_XLIB)
     #define RG_USE_SURFACE_XLIB
 #endif
 #include <RTGL1/RTGL1.h>

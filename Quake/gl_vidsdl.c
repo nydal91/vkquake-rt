@@ -582,8 +582,9 @@ static char rt_last_message[1024] = "";
 
 static void RT_PrintMessage (const char *pMessage, void *pUserData)
 {
+	size_t len = strlen (pMessage);
 	q_strlcpy (rt_last_message, pMessage, sizeof (rt_last_message));
-	Con_Warning ("%s", pMessage);
+	Con_Warning ("%s%s", pMessage, (len > 0 && pMessage[len - 1] == '\n') ? "" : "\n");
 }
 
 static void RT_ReloadShaders (void)
