@@ -88,7 +88,7 @@ cvar_t scr_sbaralpha = {"scr_sbaralpha", "0.75", CVAR_ARCHIVE};
 cvar_t scr_conwidth = {"scr_conwidth", "0", CVAR_ARCHIVE};
 cvar_t scr_conscale = {"scr_conscale", "1", CVAR_ARCHIVE};
 cvar_t scr_crosshairscale = {"scr_crosshairscale", "1", CVAR_ARCHIVE};
-cvar_t scr_showfps = {"scr_showfps", "0", CVAR_NONE};
+cvar_t scr_showfps = {"scr_showfps", "0", CVAR_ARCHIVE}; // saved: there's an option for it
 cvar_t scr_clock = {"scr_clock", "0", CVAR_NONE};
 // johnfitz
 cvar_t scr_usekfont = {"scr_usekfont", "0", CVAR_NONE}; // 2021 re-release
@@ -564,6 +564,11 @@ void SCR_DrawFPS (cb_context_t *cbx)
 		y = 200 - 8;
 		if (scr_clock.value)
 			y -= 8; // make room for clock
+#ifdef HAVE_TOUCH_CONTROLS
+		// below the touch buttons' top bar, left of JUMP / FIRE
+		AndroidTouch_DrawFPS (cbx, st);
+		return;
+#endif
 		GL_SetCanvas (cbx, CANVAS_BOTTOMRIGHT);
 		Draw_String (cbx, x, y, st);
 	}

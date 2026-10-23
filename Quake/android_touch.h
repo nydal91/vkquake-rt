@@ -35,6 +35,9 @@ void AndroidTouch_Move (usercmd_t *cmd);
 // draws the overlay (end of the 2D pass)
 void AndroidTouch_Draw (cb_context_t *cbx);
 
+// the frame rate text, top right (scr_showfps)
+void AndroidTouch_DrawFPS (cb_context_t *cbx, const char *text);
+
 // a game controller was used: hide the overlay until the next touch
 void AndroidTouch_ControllerUsed (void);
 

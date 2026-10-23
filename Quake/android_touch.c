@@ -467,6 +467,14 @@ void AndroidTouch_Draw (cb_context_t *cbx)
 		Label (cbx, STICK_W * 0.5f * W, 0.8f * H, "MOVE");
 }
 
+void AndroidTouch_DrawFPS (cb_context_t *cbx, const char *text)
+{
+	const float W = 240.0f * Aspect ();
+	GL_SetCanvas (cbx, CANVAS_TOUCH);
+	// left of the JUMP / FIRE column, below the top bar
+	Draw_String (cbx, (int)(SIDE_BTN_X * W - 8.0f * strlen (text) - 6.0f), (int)(TOP_BAR_H * 240.0f + 4.0f), text);
+}
+
 #ifdef QUAKE_TOUCH_TEST
 // Desktop test: QUAKE_TOUCH_SCRIPT="frame,d|m|u,fingerid,x,y;..." pushes SDL
 // finger events through SDL's queue at the given frames, like Android would.

@@ -955,10 +955,13 @@ again:
 //=============================================================================
 /* OPTIONS MENU */
 
+extern cvar_t scr_showfps;
+
 enum
 {
     OPT_SCRSIZE = 0,
 	OPT_CROSSHAIR,
+	OPT_SHOWFPS,
 	OPT_SCALE,
 
 	OPT_VIDEO, // RT: OPT_VIDEO must've been at the end, let's hope nothing breaks
@@ -1003,6 +1006,7 @@ static int GapOffset (int opt)
 	{		
 	case OPT_SCRSIZE:
 	case OPT_CROSSHAIR:
+	case OPT_SHOWFPS:
 	case OPT_SCALE:
 		return gapsize * 0;
 
@@ -1246,6 +1250,10 @@ void M_AdjustSliders (int dir)
 	case OPT_CROSSHAIR: // crosshair
 		Cvar_SetValue ("crosshair", ((int)crosshair.value + 3 + dir) % 3);
 		break;
+
+	case OPT_SHOWFPS:
+		Cvar_SetValue ("scr_showfps", scr_showfps.value ? 0 : 1);
+		break;
 	}
 }
 
@@ -1392,6 +1400,10 @@ void M_Options_Draw (cb_context_t *cbx)
 	// OPT_CROSSHAIR:
 	M_Print (cbx, 16, GetY(OPT_CROSSHAIR), "             Crosshair");
 	M_Print (cbx, 220, GetY(OPT_CROSSHAIR), (crosshair.value == 0.0f) ? "off" : ((crosshair.value == 1.0f) ? "cross" : "dot"));
+
+	// OPT_SHOWFPS:
+	M_Print (cbx, 16, GetY(OPT_SHOWFPS), "              Show FPS");
+	M_DrawCheckbox (cbx, 220, GetY(OPT_SHOWFPS), scr_showfps.value);
 
 	// OPT_VIDEO:
 	if (vid_menudrawfn)
