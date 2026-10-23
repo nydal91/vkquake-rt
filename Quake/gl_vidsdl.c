@@ -481,6 +481,7 @@ static qboolean VID_SetMode (int width, int height, int refreshrate, qboolean fu
 
 	vid.width = VID_GetCurrentWidth ();
 	vid.height = VID_GetCurrentHeight ();
+	Sys_Printf ("Video mode: %dx%d %s\n", vid.width, vid.height, VID_GetFullscreen () ? "fullscreen" : "windowed");
 	vid.conwidth = vid.width & 0xFFFFFFF8;
 	vid.conheight = vid.conwidth * vid.height / vid.width;
 
@@ -1604,6 +1605,16 @@ void VID_Init (void)
 		refreshrate = display_refreshrate;
 		fullscreen = false;
 	}
+
+#ifdef __ANDROID__
+	// always the whole screen (hides the system bars); the window takes the
+	// display's size whatever was asked, see VID_SetMode
+	width = display_width;
+	height = display_height;
+	refreshrate = display_refreshrate;
+	fullscreen = true;
+	Cvar_SetValueQuick (&vid_desktopfullscreen, 1);
+#endif
 
 #if RT_RENDERER
 #if defined(_WIN32)

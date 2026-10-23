@@ -935,6 +935,7 @@ void IN_SendKeyEvents (void)
 			{
 				vid.width = event.window.data1;
 				vid.height = event.window.data2;
+				Sys_Printf ("Window size: %dx%d\n", vid.width, vid.height);
 				vid.restart_next_frame = true;
 				Cvar_FindVar ("scr_conscale")->callback (NULL);
 			}

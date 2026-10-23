@@ -54,6 +54,11 @@ public class GameActivity extends SDLActivity {
         }
 
         super.onCreate(savedInstanceState);
+
+        // draw under the camera cutout too, the whole screen is the game
+        android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+        lp.layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        getWindow().setAttributes(lp);
     }
 
     @Override
