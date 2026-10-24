@@ -1,0 +1,36 @@
+From 64e8844d02e6f246c24f2a9833eb670e7c9b1ce6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:50:59 +0200
+Subject: [PATCH 8/9] Link libandroid on Android
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ CMakeLists.txt | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 96537cc..2dc10a2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -195,7 +195,7 @@ if (RG_WITH_NVIDIA_DLSS)
+             endif()
+         else()
+             target_link_libraries(RayTracedGL1 PRIVATE "$ENV{DLSS_SDK_PATH}/lib/Linux_x86_64/libnvsdk_ngx.a")
+-            target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS} ${RG_ANDROID_LIBS})
++            target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS})
+         endif()
+     else()
+         message(FATAL_ERROR 
+@@ -209,7 +209,7 @@ endif()
+ # (the system loader, or a driver the app passes in pfnVulkanGetInstanceProcAddr)
+ target_include_directories(RayTracedGL1 PRIVATE ${Vulkan_INCLUDE_DIRS})
+ target_compile_definitions(RayTracedGL1 PRIVATE VK_NO_PROTOTYPES)
+-target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS})
++target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS} ${RG_ANDROID_LIBS})
+ target_include_directories(RayTracedGL1 PUBLIC "Include")
+ 
+ # FSR2: prebuilt for Windows only; elsewhere, FSR2 requests use linear upscaling
+-- 
+2.43.0
+

@@ -1,0 +1,381 @@
+From ce75e01d18b4a298e1b4676a91fcfb5faaa16176 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 17:09:13 +0200
+Subject: [PATCH 1/9] Portability: build without FSR2 (linear upscaling
+ instead), Vulkan errors throw, feature masking, unified memory fallback,
+ glslang/GCC fixes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ CMakeLists.txt                        | 13 ++++++--
+ Source/Common.cpp                     | 14 ++++++++
+ Source/Common.h                       | 11 ++++---
+ Source/FSR2.cpp                       | 40 +++++++++++++++++++++++
+ Source/ImageComposition.cpp           |  1 +
+ Source/PhysicalDevice.cpp             | 34 +++++++++++--------
+ Source/RenderResolutionHelper.h       |  8 +++++
+ Source/Shaders/LPM/ffx_lpm.h          |  3 ++
+ Source/Shaders/ShaderCommonGLSLFunc.h |  6 ++--
+ Source/Sharpening.cpp                 |  1 +
+ Source/Vma/vk_mem_alloc_imp.cpp       |  3 ++
+ Source/VulkanDevice.cpp               |  5 +++
+ Source/VulkanDevice_Init.cpp          | 47 +++++++++++++++++++++++++++
+ 13 files changed, 163 insertions(+), 23 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9adbe74..470e3a5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -199,9 +199,18 @@ endif()
+ target_link_libraries(RayTracedGL1 PUBLIC Vulkan)
+ target_include_directories(RayTracedGL1 PUBLIC "Include")
+ 
+-# FSR2
+-target_include_directories(RayTracedGL1 PRIVATE "Source/FSR2/include" )
++# FSR2: prebuilt for Windows only; elsewhere, FSR2 requests use linear upscaling
+ if (WIN32)
++    set(RG_WITH_FSR2_DEFAULT ON)
++else()
++    set(RG_WITH_FSR2_DEFAULT OFF)
++endif()
++option(RG_WITH_FSR2 "Build with AMD FSR2 (needs its static libraries)" ${RG_WITH_FSR2_DEFAULT})
++target_include_directories(RayTracedGL1 PRIVATE "Source/FSR2/include" )
++if (NOT RG_WITH_FSR2)
++    message(STATUS "AMD FSR2 disabled: its requests fall back to linear upscaling")
++    target_compile_definitions(RayTracedGL1 PRIVATE RG_NO_FSR2 FFX_GCC)
++elseif (WIN32)
+     if (BUILD_TYPE STREQUAL "DEBUG")
+         target_link_libraries(RayTracedGL1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/Source/FSR2/win32/ffx_fsr2_api_x64d.lib" )
+         target_link_libraries(RayTracedGL1 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/Source/FSR2/win32/ffx_fsr2_api_vk_x64d.lib" )
+diff --git a/Source/Common.cpp b/Source/Common.cpp
+index d69e078..c6d6ca7 100644
+--- a/Source/Common.cpp
++++ b/Source/Common.cpp
+@@ -19,6 +19,10 @@
+ // SOFTWARE.
+ 
+ #include "Common.h"
++#include "RgException.h"
++
++#include <cstring>
++#include <string>
+ 
+ 
+ namespace RTGL1
+@@ -106,3 +110,13 @@ void RTGL1::EndCmdLabel(VkCommandBuffer cmd)
+ 
+     svkCmdEndDebugUtilsLabelEXT(cmd);
+ }
++
++
++void RTGL1::ThrowVulkanError(VkResult r, const char *file, int line)
++{
++    const char *f = std::strrchr(file, '/');
++    f = f ? f + 1 : file;
++
++    throw RgException(RG_GRAPHICS_API_ERROR,
++        "Vulkan error " + std::to_string(static_cast<int>(r)) + " at " + f + ":" + std::to_string(line));
++}
+diff --git a/Source/Common.h b/Source/Common.h
+index 3926fcc..090a0ef 100644
+--- a/Source/Common.h
++++ b/Source/Common.h
+@@ -68,10 +68,13 @@ void InitDeviceExtensionFunctions_DebugUtils(VkDevice device);
+ #pragma endregion
+ 
+ 
+-inline void VK_CHECKERROR(const VkResult r)
+-{
+-    assert(r == VK_SUCCESS);
+-}
++// Vulkan errors (negative results) throw in all builds, so a driver failure
++// is reported through rgGetResultDescription / pfnPrint instead of crashing later.
++// Positive results (VK_SUBOPTIMAL_KHR, VK_INCOMPLETE, ...) are not errors.
++[[noreturn]] void ThrowVulkanError(VkResult r, const char *file, int line);
++
++#define VK_CHECKERROR(r) \
++    do { const VkResult vk_check_r_ = (r); if (vk_check_r_ < 0) { RTGL1::ThrowVulkanError(vk_check_r_, __FILE__, __LINE__); } } while (0)
+ 
+ 
+ #define SET_DEBUG_NAME(device, obj, type, pName) AddDebugName((device), reinterpret_cast<uint64_t>(obj), (type), (pName))
+diff --git a/Source/FSR2.cpp b/Source/FSR2.cpp
+index 75f327c..ded114a 100644
+--- a/Source/FSR2.cpp
++++ b/Source/FSR2.cpp
+@@ -26,6 +26,44 @@
+ #include "RenderResolutionHelper.h"
+ #include "RgException.h"
+ 
++#ifdef RG_NO_FSR2
++
++// Built without FSR2 (its libraries are Windows-only): RenderResolutionHelper
++// turns FSR2 requests into linear upscaling, so Apply is never reached.
++
++RTGL1::FSR2::FSR2(VkDevice _device, VkPhysicalDevice _physDevice)
++    : device(_device)
++    , physDevice(_physDevice)
++    , context(std::make_unique<std::optional<FfxFsr2Context>>())
++{
++}
++
++RTGL1::FSR2::~FSR2() = default;
++
++void RTGL1::FSR2::OnFramebuffersSizeChange(const ResolutionState &resolutionState)
++{
++}
++
++RTGL1::FramebufferImageIndex RTGL1::FSR2::Apply(
++    VkCommandBuffer cmd, uint32_t frameIndex,
++    const std::shared_ptr<Framebuffers>& framebuffers,
++    const RenderResolutionHelper& renderResolution,
++    RgFloat2D jitterOffset,
++    float timeDelta,
++    float nearPlane,
++    float farPlane,
++    float fovVerticalRad)
++{
++    throw RgException(RG_WRONG_ARGUMENT, "AMD FSR2 isn't available in this build");
++}
++
++RgFloat2D RTGL1::FSR2::GetJitter(const ResolutionState& resolutionState, uint32_t frameId)
++{
++    return {};
++}
++
++#else
++
+ namespace
+ {
+     void CheckError(FfxErrorCode r)
+@@ -215,3 +253,5 @@ RgFloat2D RTGL1::FSR2::GetJitter(const ResolutionState& resolutionState, uint32_
+ 
+     return jitter;
+ }
++
++#endif // RG_NO_FSR2
+diff --git a/Source/ImageComposition.cpp b/Source/ImageComposition.cpp
+index 8158517..cc2b7e1 100644
+--- a/Source/ImageComposition.cpp
++++ b/Source/ImageComposition.cpp
+@@ -337,6 +337,7 @@ void RTGL1::ImageComposition::DestroyPipelines()
+     checkerboardPipeline = VK_NULL_HANDLE;
+ }
+ 
++#include <cmath>
+ #define A_CPU 1
+ #include "Shaders/LPM/ffx_a.h"
+ 
+diff --git a/Source/PhysicalDevice.cpp b/Source/PhysicalDevice.cpp
+index 9baae3d..2124c4c 100644
+--- a/Source/PhysicalDevice.cpp
++++ b/Source/PhysicalDevice.cpp
+@@ -100,24 +100,32 @@ uint32_t PhysicalDevice::GetMemoryTypeIndex(uint32_t memoryTypeBits, VkFlags req
+     }
+     
+ 
+-    // for each memory type available for this device
+-    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++)
++    // First pass: a type without the ignored flags (desktop: separate VRAM and system memory).
++    // Second pass: any suitable type, as on unified memory GPUs (Android, integrated)
++    // every host visible type is also device local.
++    for (bool allowIgnored : { false, true })
+     {
+-        // if type is available
+-        if ((memoryTypeBits & 1u) == 1)
+-        {
+-            VkMemoryPropertyFlags flags = memoryProperties.memoryTypes[i].propertyFlags;
++        uint32_t bits = memoryTypeBits;
+ 
+-            bool isSuitable = (flags & requirementsMask) == requirementsMask;
+-            bool isIgnored = (flags & flagsToIgnore) == flagsToIgnore;
+-            
+-            if (isSuitable && !isIgnored)
++        // for each memory type available for this device
++        for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; i++)
++        {
++            // if type is available
++            if ((bits & 1u) == 1)
+             {
+-                return i;
++                VkMemoryPropertyFlags flags = memoryProperties.memoryTypes[i].propertyFlags;
++
++                bool isSuitable = (flags & requirementsMask) == requirementsMask;
++                bool isIgnored = (flags & flagsToIgnore) == flagsToIgnore;
++
++                if (isSuitable && (!isIgnored || allowIgnored))
++                {
++                    return i;
++                }
+             }
+-        }
+ 
+-        memoryTypeBits >>= 1u;
++            bits >>= 1u;
++        }
+     }
+ 
+     throw RgException(RG_GRAPHICS_API_ERROR, "Can't find memory type for given memory property flags (" + std::to_string(requirementsMask) + ")");
+diff --git a/Source/RenderResolutionHelper.h b/Source/RenderResolutionHelper.h
+index 01f27ab..e9a3370 100644
+--- a/Source/RenderResolutionHelper.h
++++ b/Source/RenderResolutionHelper.h
+@@ -167,6 +167,14 @@ public:
+                 renderHeight = pParams->customRenderSize.height;
+             }
+         }
++
++    #ifdef RG_NO_FSR2
++        // built without FSR2: same render size, linear upscaling
++        if (upscaleTechnique == RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2)
++        {
++            upscaleTechnique = RG_RENDER_UPSCALE_TECHNIQUE_LINEAR;
++        }
++    #endif
+     }
+ 
+     float GetMipLodBias(float nativeBias = 0.0f) const
+diff --git a/Source/Shaders/LPM/ffx_lpm.h b/Source/Shaders/LPM/ffx_lpm.h
+index e74fdb5..5a07658 100644
+--- a/Source/Shaders/LPM/ffx_lpm.h
++++ b/Source/Shaders/LPM/ffx_lpm.h
+@@ -277,6 +277,8 @@ A_STATIC void LpmColRgbToXyz(outAF3 ox,outAF3 oy,outAF3 oz,inAF2 r,inAF2 g,inAF2
+  A_STATIC void LpmSetupOut(AU1 i,inAU4 v){}
+ #endif
+ //------------------------------------------------------------------------------------------------------------------------------
++// RTGL1: LpmSetup runs on the CPU only; newer glslang rejects its GPU version
++#if !(defined(A_GPU) && defined(LPM_NO_SETUP))
+ // Output goes to the user-defined LpmSetupOut() function.
+ A_STATIC void LpmSetup(
+ // Path control.
+@@ -517,6 +519,7 @@ inAF3 crosstalk){ // One channel must be 1.0, the rest can be <= 1.0 but not zer
+  map20[2]=AU1_AH2_AF2(map20z);
+  map20[3]=AU1_AH2_AF2(map20w);
+  LpmSetupOut(20,map20);}
++#endif
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ //_____________________________________________________________/\_______________________________________________________________
+diff --git a/Source/Shaders/ShaderCommonGLSLFunc.h b/Source/Shaders/ShaderCommonGLSLFunc.h
+index ee788dc..1a05cd5 100644
+--- a/Source/Shaders/ShaderCommonGLSLFunc.h
++++ b/Source/Shaders/ShaderCommonGLSLFunc.h
+@@ -69,10 +69,8 @@ layout(
+     binding = BINDING_TEXTURES)
+     uniform sampler2D globalTextures[];
+ 
+-sampler2D getTexture(uint textureIndex)
+-{
+-    return globalTextures[nonuniformEXT(textureIndex)];
+-}
++// Newer glslang rejects functions returning sampler types, so use a macro
++#define getTexture(textureIndex) (globalTextures[nonuniformEXT(textureIndex)])
+ 
+ vec4 getTextureSample(uint textureIndex, const vec2 texCoord)
+ {
+diff --git a/Source/Sharpening.cpp b/Source/Sharpening.cpp
+index ac8ab4e..713eb43 100644
+--- a/Source/Sharpening.cpp
++++ b/Source/Sharpening.cpp
+@@ -24,6 +24,7 @@
+ #include "RenderResolutionHelper.h"
+ 
+ 
++#include <cmath>
+ #define A_CPU
+ #include "Utils.h"
+ #include "Shaders/CAS/ffx_a.h"
+diff --git a/Source/Vma/vk_mem_alloc_imp.cpp b/Source/Vma/vk_mem_alloc_imp.cpp
+index 00317e0..677bbd7 100644
+--- a/Source/Vma/vk_mem_alloc_imp.cpp
++++ b/Source/Vma/vk_mem_alloc_imp.cpp
+@@ -1,2 +1,5 @@
++// snprintf is used by VMA, but not included on non-Windows platforms
++#include <cstdio>
++
+ #define VMA_IMPLEMENTATION
+ #include "vk_mem_alloc.h"
+\ No newline at end of file
+diff --git a/Source/VulkanDevice.cpp b/Source/VulkanDevice.cpp
+index 6f48dc0..a022f4b 100644
+--- a/Source/VulkanDevice.cpp
++++ b/Source/VulkanDevice.cpp
+@@ -887,8 +887,13 @@ bool RTGL1::VulkanDevice::IsRenderUpscaleTechniqueAvailable(RgRenderUpscaleTechn
+     {
+         case RG_RENDER_UPSCALE_TECHNIQUE_NEAREST:
+         case RG_RENDER_UPSCALE_TECHNIQUE_LINEAR:
++            return true;
+         case RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2:
++        #ifdef RG_NO_FSR2
++            return false;
++        #else
+             return true;
++        #endif
+         case RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS:
+             return nvDlss->IsDlssAvailable();
+         default:
+diff --git a/Source/VulkanDevice_Init.cpp b/Source/VulkanDevice_Init.cpp
+index 3e443e5..ba046b9 100644
+--- a/Source/VulkanDevice_Init.cpp
++++ b/Source/VulkanDevice_Init.cpp
+@@ -1,3 +1,4 @@
++#include <cstddef>
+ // Copyright (c) 2020-2021 Sultim Tsyrendashiev
+ // 
+ // Permission is hereby granted, free of charge, to any person obtaining a copy
+@@ -602,6 +603,52 @@ void VulkanDevice::CreateDevice()
+     physicalDeviceFeatures2.pNext = &asFeatures;
+     physicalDeviceFeatures2.features = features;
+ 
++    // Only request features the device has (lavapipe, phone GPUs lack some, e.g. depthBounds),
++    // then check the ones the renderer can't do without.
++    {
++        VkPhysicalDeviceVulkan12Features                    s12     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
++        VkPhysicalDeviceMultiviewFeatures                   sMv     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES };
++        VkPhysicalDevice16BitStorageFeatures                s16     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
++        VkPhysicalDeviceSynchronization2FeaturesKHR         sSync2  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR };
++        VkPhysicalDeviceRayTracingPipelineFeaturesKHR       sRt     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
++        VkPhysicalDeviceAccelerationStructureFeaturesKHR    sAs     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
++
++        s12.pNext = &sMv;
++        sMv.pNext = &s16;
++        s16.pNext = &sAs;
++        sAs.pNext = &sRt;
++        sRt.pNext = &sSync2;
++
++        VkPhysicalDeviceFeatures2 supported = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
++        supported.pNext = &s12;
++        vkGetPhysicalDeviceFeatures2(physDevice->Get(), &supported);
++
++        // AND each VkBool32 in [first, last] of requested with supported
++        auto maskBools = [] (void *pRequested, const void *pSupported, size_t offsetFirst, size_t offsetLast)
++        {
++            auto *r = reinterpret_cast<VkBool32 *>(static_cast<uint8_t *>(pRequested) + offsetFirst);
++            auto *sp = reinterpret_cast<const VkBool32 *>(static_cast<const uint8_t *>(pSupported) + offsetFirst);
++
++            for (size_t i = 0; i <= (offsetLast - offsetFirst) / sizeof(VkBool32); i++)
++            {
++                r[i] = r[i] && sp[i];
++            }
++        };
++
++        #define RG_MASK_FEATURES(requested, supp, Type, first, last) \
++            maskBools(&(requested), &(supp), offsetof(Type, first), offsetof(Type, last))
++
++        RG_MASK_FEATURES(physicalDeviceFeatures2.features, supported.features, VkPhysicalDeviceFeatures,             robustBufferAccess,         inheritedQueries);
++        RG_MASK_FEATURES(vulkan12Features,   s12,    VkPhysicalDeviceVulkan12Features,                   samplerMirrorClampToEdge,   subgroupBroadcastDynamicId);
++        RG_MASK_FEATURES(multiviewFeatures,  sMv,    VkPhysicalDeviceMultiviewFeatures,                  multiview,                  multiviewTessellationShader);
++        RG_MASK_FEATURES(storage16,          s16,    VkPhysicalDevice16BitStorageFeatures,               storageBuffer16BitAccess,   storageInputOutput16);
++        RG_MASK_FEATURES(sync2Features,      sSync2, VkPhysicalDeviceSynchronization2FeaturesKHR,        synchronization2,           synchronization2);
++        RG_MASK_FEATURES(rtPipelineFeatures, sRt,    VkPhysicalDeviceRayTracingPipelineFeaturesKHR,      rayTracingPipeline,         rayTraversalPrimitiveCulling);
++        RG_MASK_FEATURES(asFeatures,         sAs,    VkPhysicalDeviceAccelerationStructureFeaturesKHR,   accelerationStructure,      descriptorBindingAccelerationStructureUpdateAfterBind);
++
++        #undef RG_MASK_FEATURES
++    }
++
+     std::vector<VkExtensionProperties> supportedDeviceExtensions;
+     uint32_t supportedExtensionsCount;
+ 
+-- 
+2.43.0
+

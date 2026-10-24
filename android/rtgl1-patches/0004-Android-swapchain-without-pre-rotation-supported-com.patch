@@ -1,0 +1,297 @@
+From 85d046cad817c5b77da5a3f6d8bea4f035695326 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 18:07:28 +0200
+Subject: [PATCH 4/9] Android: swapchain without pre-rotation, supported
+ composite alpha, UNORM fallbacks; rgSetAndroidWindow to recreate the surface
+ after the app was in the background
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ Include/RTGL1/RTGL1.h        |  9 ++++
+ Source/RTGL1.cpp             |  7 +++
+ Source/Swapchain.cpp         | 84 ++++++++++++++++++++++++++++++++++--
+ Source/Swapchain.h           |  8 ++++
+ Source/VulkanDevice.h        |  4 ++
+ Source/VulkanDevice_Init.cpp | 32 ++++++++++++++
+ 6 files changed, 141 insertions(+), 3 deletions(-)
+
+diff --git a/Include/RTGL1/RTGL1.h b/Include/RTGL1/RTGL1.h
+index 15c0561..f99800a 100644
+--- a/Include/RTGL1/RTGL1.h
++++ b/Include/RTGL1/RTGL1.h
+@@ -457,6 +457,15 @@ RGAPI RgResult RGCONV rgUpdateGeometryTransform(
+     RgInstance                              rgInstance,
+     const RgUpdateTransformInfo             *pUpdateInfo);
+ 
++#ifdef RG_USE_SURFACE_ANDROID
++// Android destroys the window's surface when the app goes to the background
++// and creates a new one when it returns: pass the new window before the next
++// frame. Must be called outside of rgStartFrame / rgDrawFrame.
++RGAPI RgResult RGCONV rgSetAndroidWindow(
++    RgInstance                          rgInstance,
++    struct ANativeWindow                *window);
++#endif // RG_USE_SURFACE_ANDROID
++
+ RGAPI RgResult RGCONV rgUpdateGeometryTexCoords(
+     RgInstance                              rgInstance,
+     const RgUpdateTexCoordsInfo             *pUpdateInfo);
+diff --git a/Source/RTGL1.cpp b/Source/RTGL1.cpp
+index dfdceff..d520d20 100644
+--- a/Source/RTGL1.cpp
++++ b/Source/RTGL1.cpp
+@@ -201,6 +201,13 @@ RgResult rgSubmitStaticGeometries(RgInstance rgInstance)
+     return Call(rgInstance, &VulkanDevice::SubmitStaticGeometries);
+ }
+ 
++#ifdef RG_USE_SURFACE_ANDROID
++RgResult rgSetAndroidWindow(RgInstance rgInstance, struct ANativeWindow *window)
++{
++    return Call(rgInstance, &VulkanDevice::SetAndroidWindow, window);
++}
++#endif // RG_USE_SURFACE_ANDROID
++
+ RgResult rgUploadDirectionalLight(RgInstance rgInstance, const RgDirectionalLightUploadInfo *pUploadInfo)
+ {
+     return Call(rgInstance, &VulkanDevice::UploadDirectionalLight, pUploadInfo);
+diff --git a/Source/Swapchain.cpp b/Source/Swapchain.cpp
+index 682ab19..e0ce360 100644
+--- a/Source/Swapchain.cpp
++++ b/Source/Swapchain.cpp
+@@ -19,6 +19,7 @@
+ // SOFTWARE.
+ 
+ #include "Swapchain.h"
++#include "RgException.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -81,7 +82,10 @@ Swapchain::Swapchain(VkDevice _device,
+         std::vector<VkFormat> acceptFormats =
+         {
+             VK_FORMAT_R8G8B8A8_SRGB,
+-            VK_FORMAT_B8G8R8A8_SRGB
++            VK_FORMAT_B8G8R8A8_SRGB,
++            // fallbacks: colors are slightly off without sRGB encoding, but it runs
++            VK_FORMAT_R8G8B8A8_UNORM,
++            VK_FORMAT_B8G8R8A8_UNORM,
+         };
+ 
+         for (VkFormat f : acceptFormats)
+@@ -101,6 +105,11 @@ Swapchain::Swapchain(VkDevice _device,
+         }
+     }
+ 
++    if (surfaceFormat.format == VK_FORMAT_UNDEFINED)
++    {
++        throw RgException(RG_GRAPHICS_API_ERROR, "Surface doesn't support RGBA8 / BGRA8 swapchain formats");
++    }
++
+     // find present modes
+     {
+         uint32_t presentModeCount = 0;
+@@ -163,6 +172,19 @@ VkExtent2D Swapchain::GetOptimalExtent() const
+         return surfCapabilities.maxImageExtent;
+     }
+ 
++#ifdef __ANDROID__
++    // Android reports currentExtent in the display's native orientation. The swapchain
++    // is created without pre-rotation (see Create), so its images need the window's
++    // orientation, which the compositor rotates: swap for 90 / 270 degree displays.
++    if (surfCapabilities.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
++                                             VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR |
++                                             VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR |
++                                             VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR))
++    {
++        return { surfCapabilities.currentExtent.height, surfCapabilities.currentExtent.width };
++    }
++#endif
++
+     return surfCapabilities.currentExtent;
+ }
+ 
+@@ -172,8 +194,29 @@ bool Swapchain::RequestVsync(bool enable)
+     return requestedVsync != isVsync;
+ }
+ 
++void Swapchain::ChangeSurface(VkSurfaceKHR newSurface)
++{
++    cmdManager->WaitDeviceIdle();
++
++    // destroys the swapchain and notifies subscribers
++    Destroy();
++
++    surface = newSurface;
++    isOutdated = false;
++
++    // force TryRecreate to create a swapchain
++    surfaceExtent = { 0, 0 };
++    TryRecreate(GetOptimalExtent(), requestedVsync);
++}
++
+ void Swapchain::AcquireImage(VkSemaphore imageAvailableSemaphore)
+ {
++    if (isOutdated)
++    {
++        isOutdated = false;
++        surfaceExtent = { 0, 0 }; // force
++    }
++
+     VkExtent2D requestedExtent = GetOptimalExtent();
+ 
+     // if requested params are different
+@@ -269,9 +312,11 @@ void Swapchain::Present(const std::shared_ptr<Queues> &queues, VkSemaphore rende
+ 
+     VkResult r = vkQueuePresentKHR(queues->GetGraphics(), &presentInfo);
+ 
+-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
++    // Recreate at the next AcquireImage, not here: if the surface was lost
++    // (Android app in background), a new one is set before the next frame.
++    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_SURFACE_LOST_KHR)
+     {
+-        TryRecreate(GetOptimalExtent(), requestedVsync);
++        isOutdated = true;
+     }
+ }
+ 
+@@ -299,11 +344,13 @@ void Swapchain::Create(uint32_t newWidth, uint32_t newHeight, bool vsync, VkSwap
+     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physDevice, surface, &surfCapabilities);
+     VK_CHECKERROR(r);
+ 
++#ifndef __ANDROID__ // see GetOptimalExtent
+     if (surfCapabilities.currentExtent.width != UINT32_MAX && surfCapabilities.currentExtent.height != UINT32_MAX)
+     {
+         assert(surfaceExtent == surfCapabilities.currentExtent);
+     }
+     else
++#endif
+     {
+         assert(surfCapabilities.minImageExtent.width  <= surfaceExtent.width  && surfaceExtent.width  <= surfCapabilities.maxImageExtent.width);
+         assert(surfCapabilities.minImageExtent.height <= surfaceExtent.height && surfaceExtent.height <= surfCapabilities.maxImageExtent.height);
+@@ -332,8 +379,39 @@ void Swapchain::Create(uint32_t newWidth, uint32_t newHeight, bool vsync, VkSwap
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+     swapchainInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
++#ifdef __ANDROID__
++    // No pre-rotation: rendering is never rotated, the compositor does it
++    swapchainInfo.preTransform =
++        (surfCapabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ?
++        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : surfCapabilities.currentTransform;
++#else
+     swapchainInfo.preTransform = surfCapabilities.currentTransform;
++#endif
++    // Android surfaces usually support only INHERIT
+     swapchainInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    for (VkCompositeAlphaFlagBitsKHR a : { VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
++                                           VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
++                                           VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
++                                           VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR })
++    {
++        if (surfCapabilities.supportedCompositeAlpha & a)
++        {
++            swapchainInfo.compositeAlpha = a;
++            break;
++        }
++    }
++    {
++        const VkImageUsageFlags needed = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        if ((surfCapabilities.supportedUsageFlags & needed) != needed)
++        {
++            throw RgException(RG_GRAPHICS_API_ERROR, "Swapchain images don't support color attachment and transfer destination usage");
++        }
++        // keep TRANSFER_SRC only if available
++        if (!(surfCapabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
++        {
++            swapchainInfo.imageUsage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++        }
++    }
+     swapchainInfo.presentMode = vsync ? presentModeVsync : presentModeImmediate;
+     swapchainInfo.clipped = VK_FALSE;
+     swapchainInfo.oldSwapchain = oldSwapchain;
+diff --git a/Source/Swapchain.h b/Source/Swapchain.h
+index 29e23ee..8a1ef3e 100644
+--- a/Source/Swapchain.h
++++ b/Source/Swapchain.h
+@@ -49,6 +49,11 @@ public:
+     bool RequestVsync(bool enable);
+ 
+     void AcquireImage(VkSemaphore imageAvailableSemaphore);
++
++    // The window's surface was replaced (Android recreates it after the app was
++    // in the background): destroy the swapchain and create it on the new surface.
++    // The caller destroys the old surface afterwards.
++    void ChangeSurface(VkSurfaceKHR newSurface);
+     void BlitForPresent(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcImageWidth, uint32_t srcImageHeight, VkFilter filter, VkImageLayout srcImageLayout = VK_IMAGE_LAYOUT_GENERAL);
+     void Present(const std::shared_ptr<Queues> &queues, VkSemaphore renderFinishedSemaphore);
+ 
+@@ -97,6 +102,9 @@ private:
+     VkExtent2D surfaceExtent;
+     bool isVsync;
+ 
++    // the last present reported the swapchain as out of date / lost
++    bool isOutdated = false;
++
+     VkSwapchainKHR swapchain;
+     std::vector<VkImage> swapchainImages;
+     std::vector<VkImageView> swapchainViews;
+diff --git a/Source/VulkanDevice.h b/Source/VulkanDevice.h
+index 5467461..1db54fa 100644
+--- a/Source/VulkanDevice.h
++++ b/Source/VulkanDevice.h
+@@ -112,6 +112,10 @@ public:
+ 
+     void Print(const char *pMessage) const;
+ 
++#ifdef RG_USE_SURFACE_ANDROID
++    void SetAndroidWindow(struct ANativeWindow *window);
++#endif
++
+ private:
+     void CreateInstance(const RgInstanceCreateInfo &info);
+     void CreateDevice();
+diff --git a/Source/VulkanDevice_Init.cpp b/Source/VulkanDevice_Init.cpp
+index abaff54..2096559 100644
+--- a/Source/VulkanDevice_Init.cpp
++++ b/Source/VulkanDevice_Init.cpp
+@@ -745,6 +745,38 @@ void VulkanDevice::CreateDevice()
+     }
+ }
+ 
++#ifdef RG_USE_SURFACE_ANDROID
++void VulkanDevice::SetAndroidWindow(struct ANativeWindow *window)
++{
++    if (window == nullptr)
++    {
++        throw RgException(RG_WRONG_ARGUMENT, "Android window is null");
++    }
++
++    VkAndroidSurfaceCreateInfoKHR androidInfo = {};
++    androidInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
++    androidInfo.window = window;
++
++    VkSurfaceKHR newSurface = VK_NULL_HANDLE;
++    VkResult r = vkCreateAndroidSurfaceKHR(instance, &androidInfo, nullptr, &newSurface);
++    VK_CHECKERROR(r);
++
++    VkBool32 isSupported = VK_FALSE;
++    r = vkGetPhysicalDeviceSurfaceSupportKHR(physDevice->Get(), queues->GetIndexGraphics(), newSurface, &isSupported);
++    VK_CHECKERROR(r);
++    if (!isSupported)
++    {
++        vkDestroySurfaceKHR(instance, newSurface, nullptr);
++        throw RgException(RG_GRAPHICS_API_ERROR, "New Android window can't be presented to");
++    }
++
++    swapchain->ChangeSurface(newSurface);
++
++    vkDestroySurfaceKHR(instance, surface, nullptr);
++    surface = newSurface;
++}
++#endif // RG_USE_SURFACE_ANDROID
++
+ void VulkanDevice::CreateSyncPrimitives()
+ {
+     VkResult r;
+-- 
+2.43.0
+
