@@ -1,0 +1,86 @@
+From f5d352d7dac9a4257a1df045a326eb552e661360 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 23:06:52 +0200
+Subject: [PATCH 9/9] Exact E5B9G9R9 packing (bit exponent + ldexp, clamp
+ mantissas, NaN -> 0)
+
+log2/exp2 are approximate on some GPUs (Adreno): a mantissa could round
+to 512+ and spill into the neighbouring channel, giving pink/green/blue
+speckles on bright specular highlights. Identical output on exact GPUs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ Source/Shaders/Utils.h | 25 +++++++++++++++----------
+ 1 file changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/Source/Shaders/Utils.h b/Source/Shaders/Utils.h
+index 0fcf230..86c26db 100644
+--- a/Source/Shaders/Utils.h
++++ b/Source/Shaders/Utils.h
+@@ -157,33 +157,39 @@ vec3 safeNormalize(const vec3 v)
+ // Equals to (((float)(MANTISSA_VALUES - 1))/MANTISSA_VALUES * (1<<(MAX_VALID_BIASED_EXP-EXP_BIAS)))
+ #define ENCODE_E5B9G9R9_SHAREDEXP_MAX 65408
+ 
++// Exact on all GPUs: the exponent comes from the float's bits and the scaling
++// is done with ldexp. (log2 / exp2 are approximate on some GPUs, e.g. Adreno:
++// a mantissa could round to 512+ and spill into the next channel, which showed
++// as pink / green / blue speckles on bright highlights.) NaN is stored as 0.
+ uint encodeE5B9G9R9(vec3 unpacked)
+ {
+     const int N = ENCODE_E5B9G9R9_MANTISSA_BITS;
+     const int Np2 = 1 << N;
+     const int B = ENCODE_E5B9G9R9_EXP_BIAS;
+ 
++    unpacked = mix(unpacked, vec3(0.0), isnan(unpacked));
+     unpacked = clamp(unpacked, vec3(0.0), vec3(ENCODE_E5B9G9R9_SHAREDEXP_MAX));
+     float max_c = max(unpacked.r, max(unpacked.g, unpacked.b));
+ 
+-    // for log2
+-    if (max_c == 0.0)
++    if (!(max_c > 0.0))
+     {
+         return 0;
+     }
+ 
+-    int exp_shared_p = max(-B-1, int(floor(log2(max_c)))) + 1 + B;
+-    int max_s = int(round(max_c * exp2(-(exp_shared_p - B - N))));
++    // floor(log2(max_c)), exactly; denormals are far below the smallest exponent
++    int floor_log2 = int((floatBitsToUint(max_c) >> 23) & 0xFFu) - 127;
++
++    int exp_shared_p = max(-B-1, floor_log2) + 1 + B;
++    int max_s = int(round(ldexp(max_c, -(exp_shared_p - B - N))));
+ 
+     int exp_shared = max_s != Np2 ? 
+         exp_shared_p : 
+         exp_shared_p + 1;
+ 
+-    float s = exp2(-(exp_shared - B - N));
+-    uvec3 rgb_s = uvec3(round(unpacked * s));
++    uvec3 rgb_s = min(uvec3(round(ldexp(unpacked, ivec3(-(exp_shared - B - N))))), uvec3(ENCODE_E5B9G9R9_MANTISSA_MASK));
+ 
+     return 
+-        (exp_shared << (3 * ENCODE_E5B9G9R9_MANTISSA_BITS)) |
++        (uint(exp_shared) << (3 * ENCODE_E5B9G9R9_MANTISSA_BITS)) |
+         (rgb_s.b    << (2 * ENCODE_E5B9G9R9_MANTISSA_BITS)) |
+         (rgb_s.g    << (1 * ENCODE_E5B9G9R9_MANTISSA_BITS)) |
+         (rgb_s.r);
+@@ -195,13 +201,12 @@ vec3 decodeE5B9G9R9(const uint _packed)
+     const int B = ENCODE_E5B9G9R9_EXP_BIAS;
+ 
+     int exp_shared = int(_packed >> (3 * ENCODE_E5B9G9R9_MANTISSA_BITS));
+-    float s = exp2(exp_shared - B - N);
+ 
+-    return s * vec3(
++    return ldexp(vec3(
+         (_packed                                       ) & ENCODE_E5B9G9R9_MANTISSA_MASK, 
+         (_packed >> (1 * ENCODE_E5B9G9R9_MANTISSA_BITS)) & ENCODE_E5B9G9R9_MANTISSA_MASK,
+         (_packed >> (2 * ENCODE_E5B9G9R9_MANTISSA_BITS)) & ENCODE_E5B9G9R9_MANTISSA_MASK
+-    );
++    ), ivec3(exp_shared - B - N));
+ }
+ 
+ 
+-- 
+2.43.0
+

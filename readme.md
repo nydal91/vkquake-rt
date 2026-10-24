@@ -1,3 +1,9 @@
+> **Android and Linux port** (this fork): the renderer uses Vulkan ray
+> queries, so it runs on phones with Snapdragon 8 Gen 2 or newer (Adreno
+> 740+) and on Linux (AMD RX 6000+, NVIDIA RTX, Intel Arc). Touch controls,
+> game controllers, custom GPU drivers (Turnip), importing Quake's paks,
+> mods and maps. See [android/README.md](android/README.md) for building.
+
 # Quake: Ray Traced
 
 Quake: Ray Traced adds a path tracing renderer to id Software's [Quake](https://en.wikipedia.org/wiki/Quake_(video_game)) using the [RayTracedGL1](https://github.com/sultim-t/RayTracedGL1) library.

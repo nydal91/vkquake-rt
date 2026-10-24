@@ -1,0 +1,145 @@
+From aa558c9518d0e0dd31c1fb72e2bfe01755bd423a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:50:36 +0200
+Subject: [PATCH 7/9] Android: swapchain takes the window's size (currentExtent
+ may be in native orientation)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ CMakeLists.txt               |  3 ++-
+ Source/Swapchain.cpp         | 28 ++++++++++++++++++++--------
+ Source/Swapchain.h           |  9 +++++++++
+ Source/VulkanDevice_Init.cpp |  7 +++++++
+ 4 files changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d78ba0..96537cc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -162,6 +162,7 @@ endif()
+ if (RG_WITH_SURFACE_ANDROID)
+     message(STATUS "RG_WITH_SURFACE_ANDROID enabled")
+     add_definitions(-DRG_USE_SURFACE_ANDROID)
++    set(RG_ANDROID_LIBS android)
+     add_definitions(-DVK_USE_PLATFORM_ANDROID_KHR)
+ endif()
+ 
+@@ -194,7 +195,7 @@ if (RG_WITH_NVIDIA_DLSS)
+             endif()
+         else()
+             target_link_libraries(RayTracedGL1 PRIVATE "$ENV{DLSS_SDK_PATH}/lib/Linux_x86_64/libnvsdk_ngx.a")
+-            target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS})
++            target_link_libraries(RayTracedGL1 PRIVATE ${CMAKE_DL_LIBS} ${RG_ANDROID_LIBS})
+         endif()
+     else()
+         message(FATAL_ERROR 
+diff --git a/Source/Swapchain.cpp b/Source/Swapchain.cpp
+index e0ce360..0fc4e07 100644
+--- a/Source/Swapchain.cpp
++++ b/Source/Swapchain.cpp
+@@ -22,6 +22,9 @@
+ #include "RgException.h"
+ 
+ #include <algorithm>
++#ifdef __ANDROID__
++#include <android/native_window.h>
++#endif
+ #include <utility>
+ 
+ #include "RgException.h"
+@@ -173,15 +176,17 @@ VkExtent2D Swapchain::GetOptimalExtent() const
+     }
+ 
+ #ifdef __ANDROID__
+-    // Android reports currentExtent in the display's native orientation. The swapchain
+-    // is created without pre-rotation (see Create), so its images need the window's
+-    // orientation, which the compositor rotates: swap for 90 / 270 degree displays.
+-    if (surfCapabilities.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+-                                             VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR |
+-                                             VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR |
+-                                             VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR))
++    // The swapchain is created without pre-rotation (see Create), so its images
++    // just need the window's size; the compositor rotates and scales them.
++    // currentExtent can't be used: it may be in the display's native orientation.
++    if (androidWindow != nullptr)
+     {
+-        return { surfCapabilities.currentExtent.height, surfCapabilities.currentExtent.width };
++        int w = ANativeWindow_getWidth(androidWindow);
++        int h = ANativeWindow_getHeight(androidWindow);
++        if (w > 0 && h > 0)
++        {
++            return { uint32_t(w), uint32_t(h) };
++        }
+     }
+ #endif
+ 
+@@ -194,6 +199,13 @@ bool Swapchain::RequestVsync(bool enable)
+     return requestedVsync != isVsync;
+ }
+ 
++#ifdef __ANDROID__
++void Swapchain::SetAndroidWindow(struct ANativeWindow *window)
++{
++    androidWindow = window;
++}
++#endif
++
+ void Swapchain::ChangeSurface(VkSurfaceKHR newSurface)
+ {
+     cmdManager->WaitDeviceIdle();
+diff --git a/Source/Swapchain.h b/Source/Swapchain.h
+index 8a1ef3e..a7fdd91 100644
+--- a/Source/Swapchain.h
++++ b/Source/Swapchain.h
+@@ -54,6 +54,12 @@ public:
+     // in the background): destroy the swapchain and create it on the new surface.
+     // The caller destroys the old surface afterwards.
+     void ChangeSurface(VkSurfaceKHR newSurface);
++#ifdef __ANDROID__
++    // The swapchain takes the window's size (as the app sees it), not the
++    // surface's currentExtent, which Android may report in the display's
++    // native orientation.
++    void SetAndroidWindow(struct ANativeWindow *window);
++#endif
+     void BlitForPresent(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcImageWidth, uint32_t srcImageHeight, VkFilter filter, VkImageLayout srcImageLayout = VK_IMAGE_LAYOUT_GENERAL);
+     void Present(const std::shared_ptr<Queues> &queues, VkSemaphore renderFinishedSemaphore);
+ 
+@@ -75,6 +81,9 @@ public:
+ 
+ private:
+     VkExtent2D GetOptimalExtent() const;
++#ifdef __ANDROID__
++    struct ANativeWindow *androidWindow = nullptr;
++#endif
+ 
+     // Safe to call even if swapchain wasn't created
+     bool TryRecreate(const VkExtent2D &newExtent, bool vsync);
+diff --git a/Source/VulkanDevice_Init.cpp b/Source/VulkanDevice_Init.cpp
+index 785f4e1..a4add1d 100644
+--- a/Source/VulkanDevice_Init.cpp
++++ b/Source/VulkanDevice_Init.cpp
+@@ -102,6 +102,12 @@ VulkanDevice::VulkanDevice( const RgInstanceCreateInfo* info )
+     uniform             = std::make_shared<GlobalUniform>(device, memAllocator);
+ 
+     swapchain           = std::make_shared<Swapchain>(device, surface, physDevice->Get(), cmdManager);
++#ifdef RG_USE_SURFACE_ANDROID
++    if (info->pAndroidSurfaceCreateInfo != nullptr)
++    {
++        swapchain->SetAndroidWindow(info->pAndroidSurfaceCreateInfo->window);
++    }
++#endif
+ 
+     // for world samplers with modifyable lod biad
+     worldSamplerManager     = std::make_shared<SamplerManager>(device, 8, info->textureSamplerForceMinificationFilterLinear);
+@@ -802,6 +808,7 @@ void VulkanDevice::SetAndroidWindow(struct ANativeWindow *window)
+         throw RgException(RG_GRAPHICS_API_ERROR, "New Android window can't be presented to");
+     }
+ 
++    swapchain->SetAndroidWindow(window);
+     swapchain->ChangeSurface(newSurface);
+ 
+     vkDestroySurfaceKHR(instance, surface, nullptr);
+-- 
+2.43.0
+

@@ -24,6 +24,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // gl_texmgr.c -- fitzquake's texture manager. manages texture images
 
 #include "quakedef.h"
+
+// min / max come from windows.h on Windows
+#ifndef max
+#define max(a, b) q_max(a, b)
+#endif
+#ifndef min
+#define min(a, b) q_min(a, b)
+#endif
 #include "gl_heap.h"
 
 #if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)

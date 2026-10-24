@@ -1,0 +1,59 @@
+From c173bccedfd3de70f39e29c03d20c6e4ccc170c3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 19:42:20 +0200
+Subject: [PATCH 6/9] Fix descriptor pool types (ReSTIR, ImageComposition) and
+ empty-TLAS instance address: Adreno rejects them
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ Source/ASManager.cpp        | 3 ++-
+ Source/ImageComposition.cpp | 3 ++-
+ Source/RestirBuffers.cpp    | 3 ++-
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/Source/ASManager.cpp b/Source/ASManager.cpp
+index e8b82ad..a5fe723 100644
+--- a/Source/ASManager.cpp
++++ b/Source/ASManager.cpp
+@@ -952,7 +952,8 @@ void ASManager::BuildTLAS(VkCommandBuffer cmd, uint32_t frameIndex, const TLASPr
+     auto &instData = instGeom.geometry.instances;
+     instData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+     instData.arrayOfPointers = VK_FALSE;
+-    instData.data.deviceAddress = r.instanceCount > 0 ? instanceBuffer->GetDeviceAddress() : 0;
++    // always a valid address, even for an empty TLAS (0 is invalid per spec, strict drivers fault)
++    instData.data.deviceAddress = instanceBuffer->GetDeviceAddress();
+ 
+     // get AS size and create buffer for AS
+     VkAccelerationStructureBuildSizesInfoKHR buildSizes = asBuilder->GetTopBuildSizes(&instGeom, r.instanceCount, false);
+diff --git a/Source/ImageComposition.cpp b/Source/ImageComposition.cpp
+index cc2b7e1..08f782a 100644
+--- a/Source/ImageComposition.cpp
++++ b/Source/ImageComposition.cpp
+@@ -248,7 +248,8 @@ void RTGL1::ImageComposition::CreateDescriptors()
+     {
+         VkDescriptorPoolSize poolSize =
+         {
+-            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++            // the binding is a uniform buffer (was STORAGE_BUFFER: only some drivers accepted that)
++            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+             .descriptorCount = 1,
+         };
+ 
+diff --git a/Source/RestirBuffers.cpp b/Source/RestirBuffers.cpp
+index 9b7b284..6ec41f4 100644
+--- a/Source/RestirBuffers.cpp
++++ b/Source/RestirBuffers.cpp
+@@ -193,7 +193,8 @@ void RTGL1::RestirBuffers::CreateDescriptors()
+ 
+     VkDescriptorPoolSize poolSize = 
+     {
+-        .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
++        // the bindings are storage buffers (was UNIFORM_BUFFER: only some drivers accepted that)
++        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = std::size(bindings) * MAX_FRAMES_IN_FLIGHT,
+     };
+ 
+-- 
+2.43.0
+

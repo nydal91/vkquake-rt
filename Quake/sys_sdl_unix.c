@@ -43,6 +43,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #else
 #include "SDL.h"
 #endif
+#include "android_sys.h"
 
 qboolean isDedicated;
 
@@ -381,6 +382,11 @@ void Sys_Error (const char *error, ...)
 	va_end (argptr);
 
 	fputs (errortxt1, stderr);
+#ifdef __ANDROID__
+	Android_WriteError (text);
+	Android_SetRunning (0);
+	SDL_ShowSimpleMessageBox (SDL_MESSAGEBOX_ERROR, "Quake RT error", text, NULL);
+#endif
 	Host_Shutdown ();
 	fputs (errortxt2, stderr);
 	fputs (text, stderr);
@@ -395,14 +401,25 @@ void Sys_Printf (const char *fmt, ...)
 {
 	va_list argptr;
 
+#ifdef __ANDROID__
+	char text[4096];
+	va_start (argptr, fmt);
+	q_vsnprintf (text, sizeof (text), fmt, argptr);
+	va_end (argptr);
+	Android_Log (text);
+#else
 	va_start (argptr, fmt);
 	vprintf (fmt, argptr);
 	va_end (argptr);
+#endif
 }
 
 void Sys_Quit (void)
 {
 	Host_Shutdown ();
+#ifdef __ANDROID__
+	Android_SetRunning (0);
+#endif
 
 	exit (0);
 }

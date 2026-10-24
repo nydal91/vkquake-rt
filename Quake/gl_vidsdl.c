@@ -24,6 +24,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // gl_vidsdl.c -- SDL vid component
 
 #include "quakedef.h"
+#ifndef _WIN32
+#include "rt_vkdriver.h"
+#endif
+extern int qrt_test_frames, qrt_test_frame; // main_sdl.c
 #include "cfgfile.h"
 #include "bgmusic.h"
 #include "resource.h"
@@ -96,6 +100,20 @@ cvar_t                          r_usesops = {"r_usesops", "1", CVAR_ARCHIVE};   
 task_handle_t prev_end_rendering_task = INVALID_TASK_HANDLE;
 
 // RT
+// phones: AMD CAS sharpening by default, as the upscale is linear (no FSR2 there)
+#ifdef __ANDROID__
+#define RT_SHARPEN_DEFAULT "2"
+#else
+#define RT_SHARPEN_DEFAULT "0"
+#endif
+// without FSR2's libraries (Linux, Android), its menu entry picks the render
+// resolution, upscaled linearly (see RTGL1's RenderResolutionHelper)
+#ifdef _WIN32
+#define RT_FSR2_IS_LINEAR 0
+#else
+#define RT_FSR2_IS_LINEAR 1
+#endif
+
 #define CVAR_DEF_LIST( CVAR_DEF_T ) \
 	\
 	CVAR_DEF_T (rt_classic_render, "0") \
@@ -174,7 +192,7 @@ task_handle_t prev_end_rendering_task = INVALID_TASK_HANDLE;
 	\
 	CVAR_DEF_T (rt_portal_twirl, "1") \
     \
-	CVAR_DEF_T (rt_sharpen, "0") \
+	CVAR_DEF_T (rt_sharpen, RT_SHARPEN_DEFAULT) \
 	CVAR_DEF_T (rt_renderscale, "0") \
 	CVAR_DEF_T (rt_vintage, "0") \
 	CVAR_DEF_T (rt_upscale_fsr2, "2") \
@@ -477,6 +495,7 @@ static qboolean VID_SetMode (int width, int height, int refreshrate, qboolean fu
 
 	vid.width = VID_GetCurrentWidth ();
 	vid.height = VID_GetCurrentHeight ();
+	Sys_Printf ("Video mode: %dx%d %s\n", vid.width, vid.height, VID_GetFullscreen () ? "fullscreen" : "windowed");
 	vid.conwidth = vid.width & 0xFFFFFFF8;
 	vid.conheight = vid.conwidth * vid.height / vid.width;
 
@@ -574,9 +593,13 @@ void VID_Lock (void)
 //
 //==============================================================================
 
+static char rt_last_message[1024] = "";
+
 static void RT_PrintMessage (const char *pMessage, void *pUserData)
 {
-	Con_Warning (pMessage);
+	size_t len = strlen (pMessage);
+	q_strlcpy (rt_last_message, pMessage, sizeof (rt_last_message));
+	Con_Warning ("%s%s", pMessage, (len > 0 && pMessage[len - 1] == '\n') ? "" : "\n");
 }
 
 static void RT_ReloadShaders (void)
@@ -637,8 +660,10 @@ static void GL_InitInstance (void)
 
 #ifdef RG_USE_SURFACE_WIN32
 	RgWin32SurfaceCreateInfo win32Info = {.hinstance = wmInfo.info.win.hinstance, .hwnd = wmInfo.info.win.window};
-#elif RG_USE_SURFACE_XLIB
+#elif defined(RG_USE_SURFACE_XLIB)
 	RgXlibSurfaceCreateInfo x11Info = {.dpy = wmInfo.info.x11.display, .window = wmInfo.info.x11.window};
+#elif defined(RG_USE_SURFACE_ANDROID)
+	RgAndroidSurfaceCreateInfo androidInfo = {.window = wmInfo.info.android.window};
 #endif
 
 	const char pShaderPath[] = RT_OVERRIDEN_FOLDER "shaders/";
@@ -651,8 +676,14 @@ static void GL_InitInstance (void)
 
 #ifdef RG_USE_SURFACE_WIN32
 		.pWin32SurfaceInfo = &win32Info,
-#elif RG_USE_SURFACE_XLIB
+#elif defined(RG_USE_SURFACE_XLIB)
 		.pXlibSurfaceCreateInfo = &x11Info,
+#elif defined(RG_USE_SURFACE_ANDROID)
+		.pAndroidSurfaceCreateInfo = &androidInfo,
+#endif
+#ifndef _WIN32
+		// a custom GPU driver chosen in the launcher (e.g. Mesa Turnip), or NULL
+		.pfnVulkanGetInstanceProcAddr = RT_LoadCustomVulkanDriver (),
 #endif
 		
 		.pfnPrint = RT_PrintMessage,
@@ -691,6 +722,12 @@ static void GL_InitInstance (void)
 	};
 
 	RgResult r = rgCreateInstance (&info, &vulkan_globals.instance);
+#ifndef _WIN32
+	RT_LogVulkanDriverFiles ();
+	if (r != RG_SUCCESS)
+		Sys_Error ("Couldn't start the ray tracing renderer: %s\n\nGPU driver: %s\n\n%s", rgGetResultDescription (r), RT_CustomVulkanDriverDesc (),
+		           rt_last_message);
+#endif
 	RG_CHECK (r);
 
 
@@ -722,8 +759,40 @@ static void GL_InitInstance (void)
 GL_BeginRenderingTask
 =================
 */
+#ifdef __ANDROID__
+static volatile qboolean android_window_changed = false;
+
+// the app came back from the background with a new surface
+void VID_AndroidWindowChanged (void)
+{
+	android_window_changed = true;
+}
+
+static void ApplyAndroidWindowChange (void)
+{
+	SDL_SysWMinfo wmInfo;
+
+	if (!android_window_changed || !vulkan_globals.instance)
+		return;
+	android_window_changed = false;
+
+	SDL_VERSION (&wmInfo.version);
+	if (!SDL_GetWindowWMInfo (draw_context, &wmInfo) || wmInfo.info.android.window == NULL)
+	{
+		Sys_Printf ("RT: no Android window to recreate the surface with\n");
+		return;
+	}
+	RgResult r = rgSetAndroidWindow (vulkan_globals.instance, wmInfo.info.android.window);
+	if (r != RG_SUCCESS)
+		Sys_Error ("Can't recreate the ray tracing surface: %s\n\n%s", rgGetResultDescription (r), rt_last_message);
+}
+#endif
+
 void GL_BeginRenderingTask (void *unused)
 {
+#ifdef __ANDROID__
+	ApplyAndroidWindowChange ();
+#endif
 	RgStartFrameInfo info = {
 		.requestVSync = CVAR_TO_BOOL (vid_vsync),
 		.requestShaderReload = request_shaders_reload,
@@ -896,6 +965,11 @@ static void UpscaleCvarsToRtgl (RgDrawFrameRenderResolutionParams *pDst)
 
 static const char *GetUpscalerOptionName (int i, RgRenderUpscaleTechnique technique)
 {
+	if (RT_FSR2_IS_LINEAR && technique == RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2)
+	{
+		static const char *names[] = {"100%", "67%", "58%", "50%", "33%"};
+		return names[CLAMP (0, i, 4)];
+	}
 	if (!rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, technique))
 	{
 		return "Not Available";
@@ -1228,7 +1302,7 @@ static void GL_EndRenderingTask (end_rendering_parms_t *parms)
 		.rayCullMaskWorld = RG_DRAW_FRAME_RAY_CULL_WORLD_0_BIT | RG_DRAW_FRAME_RAY_CULL_WORLD_1_BIT | RG_DRAW_FRAME_RAY_CULL_SKY_BIT,
 		.disableRayTracedGeometry = false,
 		.disableRasterization = false,
-		.currentTime = (double)SDL_GetTicks () / 1000.0,
+		.currentTime = qrt_test_frames > 0 ? qrt_test_frame / 30.0 : (double)SDL_GetTicks () / 1000.0,
 		.disableEyeAdaptation = false,
 		.forceAntiFirefly = CVAR_TO_BOOL (rt_antifirefly),
 		.pRenderResolutionParams = &resolution_params,
@@ -1550,6 +1624,16 @@ void VID_Init (void)
 		refreshrate = display_refreshrate;
 		fullscreen = false;
 	}
+
+#ifdef __ANDROID__
+	// always the whole screen (hides the system bars); the window takes the
+	// display's size whatever was asked, see VID_SetMode
+	width = display_width;
+	height = display_height;
+	refreshrate = display_refreshrate;
+	fullscreen = true;
+	Cvar_SetValueQuick (&vid_desktopfullscreen, 1);
+#endif
 
 #if RT_RENDERER
 #if defined(_WIN32)
@@ -1994,7 +2078,7 @@ static void VID_Menu_ChooseNextRate (int dir)
 
 static void VID_Menu_ChooseNextAA (int vidopt, int dir)
 {
-	RgBool32 fsr2_ok = rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2);
+	RgBool32 fsr2_ok = RT_FSR2_IS_LINEAR || rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2);
 	RgBool32 dlss_ok = rgIsRenderUpscaleTechniqueAvailable (vulkan_globals.instance, RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS);
 
 	const int prev_fsr2 = menu_settings.rt_upscale_fsr2;
@@ -2286,7 +2370,7 @@ static void VID_MenuDraw (cb_context_t *cbx)
 		case VID_OPT_FSR2:
 			y += 8; // separate
 
-			M_Print (cbx, 16, y, "       AMD FSR 2.0");
+			M_Print (cbx, 16, y, RT_FSR2_IS_LINEAR ? " Render resolution" : "       AMD FSR 2.0");
 			M_Print (cbx, 184, y, GetUpscalerOptionName (menu_settings.rt_upscale_fsr2, RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2));
 			break;
 		case VID_OPT_DLSS:

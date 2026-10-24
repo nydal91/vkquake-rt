@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="show_log"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/show_log">
+        <intent
+            android:action="org.quakert.android.SHOW_LOG"
+            android:targetPackage="org.quakert.android"
+            android:targetClass="org.quakert.android.LauncherActivity" />
+    </shortcut>
+</shortcuts>

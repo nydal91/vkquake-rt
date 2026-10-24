@@ -1,0 +1,2433 @@
+From 0e9e6145d6879f4388addff05ebaa0163f9e4796 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 23 Oct 2026 18:04:25 +0200
+Subject: [PATCH 2/9] Trace rays with VK_KHR_ray_query; bind 7 descriptor sets
+
+Android GPUs expose ray queries but not ray tracing pipelines, and bind at
+most 8 descriptor sets (Turnip: 7); the path tracer needed 12.
+
+- the 8 raygen shaders are compute shaders (8x8 groups, 3D for volumetrics);
+  closest-hit, miss and alpha-test any-hit logic is inlined in RaygenCommon.h
+- TLAS, global uniform, blue noise, cubemaps, render cubemap and portals are
+  copied each frame into one combined set; the other sets are renumbered
+- pipeline/shader stages RAY_TRACING -> COMPUTE; device needs ray query
+  instead of ray tracing pipeline
+- startup check of descriptor and compute limits
+
+Pixel-identical to the ray tracing pipeline on lavapipe (Quake start map,
+30 deterministic frames); a deliberately broken shader changes 97% of pixels.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01K7ddVeaJCm7c4L64HWexay
+---
+ Source/ASManager.cpp                          |   2 +-
+ Source/Common.h                               |   5 +-
+ Source/CubemapManager.cpp                     |   2 -
+ Source/CubemapManager.h                       |   4 +
+ Source/DecalManager.cpp                       |   2 +-
+ Source/FSR2.cpp                               |   2 +-
+ Source/Framebuffers.cpp                       |   4 +-
+ Source/Framebuffers.h                         |   6 +-
+ Source/Generated/GenerateShaderCommon.py      |  19 +
+ Source/Generated/ShaderCommonC.h              |  16 +
+ Source/Generated/ShaderCommonGLSL.h           |  16 +
+ Source/GeomInfoManager.cpp                    |   4 +-
+ Source/LightManager.cpp                       |   4 +-
+ Source/PathTracer.cpp                         |  69 +-
+ Source/PathTracer.h                           |   7 +
+ Source/PhysicalDevice.cpp                     |  60 +-
+ Source/PhysicalDevice.h                       |   5 +-
+ Source/PortalList.cpp                         |   2 +-
+ Source/RayTracingPipeline.cpp                 | 594 +++++++++---------
+ Source/RayTracingPipeline.h                   |  93 +--
+ Source/RestirBuffers.cpp                      |  10 +-
+ Source/ShaderManager.cpp                      |  22 +-
+ Source/Shaders/RaygenCommon.h                 | 240 +++++--
+ Source/Shaders/RaygenPrimary.inl              |  18 +-
+ Source/Shaders/RtAlphaTest.rahit              |  57 --
+ Source/Shaders/RtClsOpaque.rchit              |  34 -
+ .../{RtGradients.rgen => RtGradients.comp}    |   7 +-
+ ...servoirs.rgen => RtInitialReservoirs.comp} |   7 +-
+ Source/Shaders/RtMiss.rmiss                   |  29 -
+ Source/Shaders/RtMissShadowCheck.rmiss        |  31 -
+ ...tRaygenDirect.rgen => RtRaygenDirect.comp} |   7 +-
+ Source/Shaders/RtRaygenIndirect.inl           |  14 +-
+ ...tFinal.rgen => RtRaygenIndirectFinal.comp} |   0
+ ...ectInit.rgen => RtRaygenIndirectInit.comp} |   0
+ ...aygenPrimary.rgen => RtRaygenPrimary.comp} |   0
+ ...genReflRefr.rgen => RtRaygenReflRefr.comp} |   0
+ .../{RtVolumetric.rgen => RtVolumetric.comp}  |   7 +-
+ Source/Shaders/ShaderCommonGLSLFunc.h         |  19 +
+ Source/TextureManager.cpp                     |   5 +
+ Source/TextureManager.h                       |   1 +
+ Source/TextureUploader.cpp                    |   6 +-
+ Source/Utils.cpp                              |   2 +-
+ Source/VertexCollector.cpp                    |   4 +-
+ Source/Volumetric.cpp                         |  12 +-
+ Source/VulkanDevice_Init.cpp                  |  54 +-
+ 45 files changed, 830 insertions(+), 672 deletions(-)
+ delete mode 100644 Source/Shaders/RtAlphaTest.rahit
+ delete mode 100644 Source/Shaders/RtClsOpaque.rchit
+ rename Source/Shaders/{RtGradients.rgen => RtGradients.comp} (97%)
+ rename Source/Shaders/{RtInitialReservoirs.rgen => RtInitialReservoirs.comp} (94%)
+ delete mode 100644 Source/Shaders/RtMiss.rmiss
+ delete mode 100644 Source/Shaders/RtMissShadowCheck.rmiss
+ rename Source/Shaders/{RtRaygenDirect.rgen => RtRaygenDirect.comp} (95%)
+ rename Source/Shaders/{RtRaygenIndirectFinal.rgen => RtRaygenIndirectFinal.comp} (100%)
+ rename Source/Shaders/{RtRaygenIndirectInit.rgen => RtRaygenIndirectInit.comp} (100%)
+ rename Source/Shaders/{RtRaygenPrimary.rgen => RtRaygenPrimary.comp} (100%)
+ rename Source/Shaders/{RtRaygenReflRefr.rgen => RtRaygenReflRefr.comp} (100%)
+ rename Source/Shaders/{RtVolumetric.rgen => RtVolumetric.comp} (98%)
+
+diff --git a/Source/ASManager.cpp b/Source/ASManager.cpp
+index ec76acd..e8b82ad 100644
+--- a/Source/ASManager.cpp
++++ b/Source/ASManager.cpp
+@@ -213,7 +213,7 @@ void ASManager::CreateDescriptors()
+         bnd.binding = BINDING_ACCELERATION_STRUCTURE_MAIN;
+         bnd.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+         bnd.descriptorCount = 1;
+-        bnd.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
++        bnd.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+ 
+         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+diff --git a/Source/Common.h b/Source/Common.h
+index 090a0ef..c0396e4 100644
+--- a/Source/Common.h
++++ b/Source/Common.h
+@@ -41,12 +41,9 @@ constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+ 	VK_EXTENSION_FUNCTION(vkCmdPipelineBarrier2KHR) \
+ 	VK_EXTENSION_FUNCTION(vkCreateAccelerationStructureKHR) \
+ 	VK_EXTENSION_FUNCTION(vkDestroyAccelerationStructureKHR) \
+-	VK_EXTENSION_FUNCTION(vkGetRayTracingShaderGroupHandlesKHR) \
+-	VK_EXTENSION_FUNCTION(vkCreateRayTracingPipelinesKHR) \
+ 	VK_EXTENSION_FUNCTION(vkGetAccelerationStructureDeviceAddressKHR) \
+ 	VK_EXTENSION_FUNCTION(vkGetAccelerationStructureBuildSizesKHR) \
+-	VK_EXTENSION_FUNCTION(vkCmdBuildAccelerationStructuresKHR) \
+-	VK_EXTENSION_FUNCTION(vkCmdTraceRaysKHR)
++	VK_EXTENSION_FUNCTION(vkCmdBuildAccelerationStructuresKHR)
+ 
+ #define VK_DEVICE_DEBUG_UTILS_FUNCTION_LIST \
+ 	VK_EXTENSION_FUNCTION(vkSetDebugUtilsObjectNameEXT) \
+diff --git a/Source/CubemapManager.cpp b/Source/CubemapManager.cpp
+index eaadd43..0cdbea1 100644
+--- a/Source/CubemapManager.cpp
++++ b/Source/CubemapManager.cpp
+@@ -27,8 +27,6 @@
+ 
+ namespace
+ {
+-    constexpr uint32_t MAX_CUBEMAP_COUNT = 32;
+-
+     // use albedo-alpha texture data
+     constexpr uint32_t MATERIAL_COLOR_TEXTURE_INDEX = 0;
+     static_assert(MATERIAL_COLOR_TEXTURE_INDEX < RTGL1::TEXTURES_PER_MATERIAL_COUNT);
+diff --git a/Source/CubemapManager.h b/Source/CubemapManager.h
+index 89720ad..ad75302 100644
+--- a/Source/CubemapManager.h
++++ b/Source/CubemapManager.h
+@@ -37,6 +37,10 @@
+ namespace RTGL1
+ {
+ 
++// cubemap descriptor array size; the ray query passes copy it into their combined set
++constexpr uint32_t MAX_CUBEMAP_COUNT = 32;
++
++
+ class CubemapManager
+ {
+ public:
+diff --git a/Source/DecalManager.cpp b/Source/DecalManager.cpp
+index 5e2f4f9..a21dfb3 100644
+--- a/Source/DecalManager.cpp
++++ b/Source/DecalManager.cpp
+@@ -242,7 +242,7 @@ void RTGL1::DecalManager::CreateRenderPass()
+     VkSubpassDependency dependency = {};
+     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+     dependency.dstSubpass = 0;
+-    dependency.srcStageMask = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++    dependency.srcStageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+     dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+     dependency.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; // imageStore
+     dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+diff --git a/Source/FSR2.cpp b/Source/FSR2.cpp
+index ded114a..70f537e 100644
+--- a/Source/FSR2.cpp
++++ b/Source/FSR2.cpp
+@@ -153,7 +153,7 @@ namespace
+             b = {};
+ 
+             b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+-            b.srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++            b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+             b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT;
+             b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+             b.dstAccessMask = inputsAndOutput[i] == OUTPUT_IMAGE_INDEX ? VK_ACCESS_2_SHADER_WRITE_BIT : VK_ACCESS_2_SHADER_READ_BIT;
+diff --git a/Source/Framebuffers.cpp b/Source/Framebuffers.cpp
+index 902329e..c81c4d7 100644
+--- a/Source/Framebuffers.cpp
++++ b/Source/Framebuffers.cpp
+@@ -98,7 +98,7 @@ void Framebuffers::CreateDescriptors()
+         bnd.binding = ShFramebuffers_Bindings[i];
+         bnd.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+         bnd.descriptorCount = 1;
+-        bnd.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++        bnd.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+ 
+         bndCount++;
+     }
+@@ -117,7 +117,7 @@ void Framebuffers::CreateDescriptors()
+         bnd.binding = ShFramebuffers_Sampler_Bindings[i];
+         bnd.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+         bnd.descriptorCount = 1;
+-        bnd.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++        bnd.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+ 
+         bndCount++;
+     }
+diff --git a/Source/Framebuffers.h b/Source/Framebuffers.h
+index 55f85fc..d245b22 100644
+--- a/Source/Framebuffers.h
++++ b/Source/Framebuffers.h
+@@ -148,7 +148,7 @@ inline void Framebuffers::BarrierMultiple(VkCommandBuffer cmd, uint32_t frameInd
+             srcAccess = VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+             srcStage =
+                 VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT_KHR |
+-                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
++                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR | 
+                 VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT_KHR;
+             break;
+@@ -156,7 +156,7 @@ inline void Framebuffers::BarrierMultiple(VkCommandBuffer cmd, uint32_t frameInd
+             srcAccess = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+             srcStage =
+                 VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT_KHR |
+-                VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
++                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+             break;
+         case BarrierType::ColorAttachment:
+@@ -179,7 +179,7 @@ inline void Framebuffers::BarrierMultiple(VkCommandBuffer cmd, uint32_t frameInd
+         VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR | VK_ACCESS_2_TRANSFER_READ_BIT_KHR;
+     dstStage = 
+         VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT_KHR | 
+-        VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | 
++        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | 
+         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR |
+         VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT_KHR;
+ 
+diff --git a/Source/Generated/GenerateShaderCommon.py b/Source/Generated/GenerateShaderCommon.py
+index 2d8fe59..365e652 100644
+--- a/Source/Generated/GenerateShaderCommon.py
++++ b/Source/Generated/GenerateShaderCommon.py
+@@ -301,6 +301,25 @@ CONST = {
+     "SBT_INDEX_MISS_SHADOW"                 : 1,
+     "SBT_INDEX_HITGROUP_FULLY_OPAQUE"       : 0,
+     "SBT_INDEX_HITGROUP_ALPHA_TESTED"       : 1,
++
++    # ray query path: former raygen shaders are dispatched as compute
++    # and their descriptor sets merged/renumbered (mobile GPUs bind few sets)
++    "COMPUTE_RAY_QUERY_GROUP_SIZE_X"          : 8,
++    "COMPUTE_RAY_QUERY_GROUP_SIZE_Y"          : 8,
++    "DESC_SET_RQ_FRAMEBUFFERS"                : 0,
++    "DESC_SET_RQ_VERTEX_DATA"                 : 1,
++    "DESC_SET_RQ_TEXTURES"                    : 2,
++    "DESC_SET_RQ_LIGHT_SOURCES"               : 3,
++    "DESC_SET_RQ_RESTIR_INDIRECT"             : 4,
++    "DESC_SET_RQ_VOLUMETRIC"                  : 5,
++    "DESC_SET_RQ_COMBINED"                    : 6,
++    "DESC_SET_RQ_COUNT"                       : 7,
++    "BINDING_RQ_ACCELERATION_STRUCTURE_MAIN"  : 0,
++    "BINDING_RQ_GLOBAL_UNIFORM"               : 1,
++    "BINDING_RQ_BLUE_NOISE"                   : 2,
++    "BINDING_RQ_CUBEMAPS"                     : 3,
++    "BINDING_RQ_RENDER_CUBEMAP"               : 4,
++    "BINDING_RQ_PORTAL_INSTANCES"             : 5,
+     
+     "MATERIAL_ALBEDO_ALPHA_INDEX"                   : 0,
+     "MATERIAL_ROUGHNESS_METALLIC_EMISSION_INDEX"    : 1,
+diff --git a/Source/Generated/ShaderCommonC.h b/Source/Generated/ShaderCommonC.h
+index 8bae872..c0fa803 100644
+--- a/Source/Generated/ShaderCommonC.h
++++ b/Source/Generated/ShaderCommonC.h
+@@ -77,6 +77,22 @@ namespace RTGL1
+ #define SBT_INDEX_MISS_SHADOW (1)
+ #define SBT_INDEX_HITGROUP_FULLY_OPAQUE (0)
+ #define SBT_INDEX_HITGROUP_ALPHA_TESTED (1)
++#define COMPUTE_RAY_QUERY_GROUP_SIZE_X (8)
++#define COMPUTE_RAY_QUERY_GROUP_SIZE_Y (8)
++#define DESC_SET_RQ_FRAMEBUFFERS (0)
++#define DESC_SET_RQ_VERTEX_DATA (1)
++#define DESC_SET_RQ_TEXTURES (2)
++#define DESC_SET_RQ_LIGHT_SOURCES (3)
++#define DESC_SET_RQ_RESTIR_INDIRECT (4)
++#define DESC_SET_RQ_VOLUMETRIC (5)
++#define DESC_SET_RQ_COMBINED (6)
++#define DESC_SET_RQ_COUNT (7)
++#define BINDING_RQ_ACCELERATION_STRUCTURE_MAIN (0)
++#define BINDING_RQ_GLOBAL_UNIFORM (1)
++#define BINDING_RQ_BLUE_NOISE (2)
++#define BINDING_RQ_CUBEMAPS (3)
++#define BINDING_RQ_RENDER_CUBEMAP (4)
++#define BINDING_RQ_PORTAL_INSTANCES (5)
+ #define MATERIAL_ALBEDO_ALPHA_INDEX (0)
+ #define MATERIAL_ROUGHNESS_METALLIC_EMISSION_INDEX (1)
+ #define MATERIAL_NORMAL_INDEX (2)
+diff --git a/Source/Generated/ShaderCommonGLSL.h b/Source/Generated/ShaderCommonGLSL.h
+index 9123d97..a8e1a17 100644
+--- a/Source/Generated/ShaderCommonGLSL.h
++++ b/Source/Generated/ShaderCommonGLSL.h
+@@ -70,6 +70,22 @@
+ #define SBT_INDEX_MISS_SHADOW (1)
+ #define SBT_INDEX_HITGROUP_FULLY_OPAQUE (0)
+ #define SBT_INDEX_HITGROUP_ALPHA_TESTED (1)
++#define COMPUTE_RAY_QUERY_GROUP_SIZE_X (8)
++#define COMPUTE_RAY_QUERY_GROUP_SIZE_Y (8)
++#define DESC_SET_RQ_FRAMEBUFFERS (0)
++#define DESC_SET_RQ_VERTEX_DATA (1)
++#define DESC_SET_RQ_TEXTURES (2)
++#define DESC_SET_RQ_LIGHT_SOURCES (3)
++#define DESC_SET_RQ_RESTIR_INDIRECT (4)
++#define DESC_SET_RQ_VOLUMETRIC (5)
++#define DESC_SET_RQ_COMBINED (6)
++#define DESC_SET_RQ_COUNT (7)
++#define BINDING_RQ_ACCELERATION_STRUCTURE_MAIN (0)
++#define BINDING_RQ_GLOBAL_UNIFORM (1)
++#define BINDING_RQ_BLUE_NOISE (2)
++#define BINDING_RQ_CUBEMAPS (3)
++#define BINDING_RQ_RENDER_CUBEMAP (4)
++#define BINDING_RQ_PORTAL_INSTANCES (5)
+ #define MATERIAL_ALBEDO_ALPHA_INDEX (0)
+ #define MATERIAL_ROUGHNESS_METALLIC_EMISSION_INDEX (1)
+ #define MATERIAL_NORMAL_INDEX (2)
+diff --git a/Source/GeomInfoManager.cpp b/Source/GeomInfoManager.cpp
+index 0fc74c9..5f318d9 100644
+--- a/Source/GeomInfoManager.cpp
++++ b/Source/GeomInfoManager.cpp
+@@ -132,7 +132,7 @@ bool RTGL1::GeomInfoManager::CopyFromStaging(VkCommandBuffer cmd, uint32_t frame
+             {
+                 vkCmdPipelineBarrier(
+                     cmd,
+-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     0,
+                     0, nullptr,
+                     infoCount, barriers,
+@@ -207,7 +207,7 @@ bool RTGL1::GeomInfoManager::CopyFromStaging(VkCommandBuffer cmd, uint32_t frame
+         {
+             vkCmdPipelineBarrier(
+                 cmd,
+-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 0,
+                 0, nullptr,
+                 infoCount, barriers,
+diff --git a/Source/LightManager.cpp b/Source/LightManager.cpp
+index 2a477d2..278383c 100644
+--- a/Source/LightManager.cpp
++++ b/Source/LightManager.cpp
+@@ -388,7 +388,7 @@ void RTGL1::LightManager::BarrierLightGrid(VkCommandBuffer cmd, uint32_t frameIn
+         .pNext = nullptr,
+         .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+-        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
++        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+         .srcQueueFamilyIndex = 0,
+         .dstQueueFamilyIndex = 0,
+@@ -462,7 +462,7 @@ void RTGL1::LightManager::CreateDescriptors()
+         b.binding = bnd;
+         b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         b.descriptorCount = 1;
+-        b.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
++        b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+     }
+ 
+     VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+diff --git a/Source/PathTracer.cpp b/Source/PathTracer.cpp
+index fe1ba1b..25c7bf2 100644
+--- a/Source/PathTracer.cpp
++++ b/Source/PathTracer.cpp
+@@ -43,43 +43,23 @@ PathTracer::TraceParams PathTracer::Bind( VkCommandBuffer                  cmd,
+                                           const PortalList*                portalList,
+                                           const Volumetric*                volumetric )
+ {
+-    rtPipeline->Bind(cmd);
+-
+-    VkDescriptorSet sets[] = {
+-        // ray tracing acceleration structures
+-        scene->GetASManager()->GetTLASDescSet(frameIndex),
+-        // storage images
+-        framebuffers->GetDescSet(frameIndex),
+-        // uniform
+-        uniform->GetDescSet(frameIndex),
+-        // vertex data
+-        scene->GetASManager()->GetBuffersDescSet(frameIndex),
+-        // textures
+-        textureManager->GetDescSet(frameIndex),
+-        // uniform random
+-        blueNoise->GetDescSet(),
+-        // light sources
+-        scene->GetLightManager()->GetDescSet(frameIndex),
+-        // cubemaps
+-        cubemapManager->GetDescSet(frameIndex),
+-        // dynamic cubemaps
+-        renderCubemap->GetDescSet(),
+-        // portals
+-        portalList->GetDescSet(frameIndex),
+-        // device local buffers for restir
+-        restirBuffers->GetDescSet(frameIndex),
+-        // device local buffers for volumetrics
+-        volumetric->GetDescSet(frameIndex),
+-    };
+-
+-    vkCmdBindDescriptorSets( cmd,
+-                             VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+-                             rtPipeline->GetLayout(),
+-                             0,
+-                             std::size( sets ),
+-                             sets,
+-                             0,
+-                             nullptr );
++    // ray query passes: compute pipelines with fewer, merged descriptor sets (see RayTracingPipeline)
++    RayTracingPipeline::CombinedSetSources combined = {};
++    combined.tlas          = scene->GetASManager()->GetTLASDescSet( frameIndex );
++    combined.uniform       = uniform->GetDescSet( frameIndex );
++    combined.blueNoise     = blueNoise->GetDescSet();
++    combined.cubemaps      = cubemapManager->GetDescSet( frameIndex );
++    combined.renderCubemap = renderCubemap->GetDescSet();
++    combined.portals       = portalList->GetDescSet( frameIndex );
++
++    currentSets                                = {};
++    currentSets[ DESC_SET_RQ_FRAMEBUFFERS ]    = framebuffers->GetDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_VERTEX_DATA ]     = scene->GetASManager()->GetBuffersDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_TEXTURES ]        = textureManager->GetDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_LIGHT_SOURCES ]   = scene->GetLightManager()->GetDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_RESTIR_INDIRECT ] = restirBuffers->GetDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_VOLUMETRIC ]      = volumetric->GetDescSet( frameIndex );
++    currentSets[ DESC_SET_RQ_COMBINED ]        = rtPipeline->UpdateCombinedDescSet( frameIndex, combined );
+ 
+     TraceParams p = {};
+     p.cmd = cmd;
+@@ -94,13 +74,16 @@ PathTracer::TraceParams PathTracer::Bind( VkCommandBuffer                  cmd,
+ 
+ void PathTracer::TraceRays(VkCommandBuffer cmd, uint32_t sbtRayGenIndex, uint32_t width, uint32_t height, uint32_t depth)
+ {
+-    VkStridedDeviceAddressRegionKHR raygenEntry, missEntry, hitEntry, callableEntry;
+-    rtPipeline->GetEntries(sbtRayGenIndex, raygenEntry, missEntry, hitEntry, callableEntry);
++    vkCmdBindDescriptorSets( cmd,
++                             VK_PIPELINE_BIND_POINT_COMPUTE,
++                             rtPipeline->GetLayout(),
++                             0,
++                             static_cast< uint32_t >( currentSets.size() ),
++                             currentSets.data(),
++                             0,
++                             nullptr );
+ 
+-    svkCmdTraceRaysKHR(
+-        cmd,
+-        &raygenEntry, &missEntry, &hitEntry, &callableEntry,
+-        width, height, depth);
++    rtPipeline->TraceRays( cmd, sbtRayGenIndex, width, height, depth );
+ }
+ 
+ void PathTracer::TracePrimaryRays(const TraceParams &params)
+diff --git a/Source/PathTracer.h b/Source/PathTracer.h
+index 79bb442..43f3023 100644
+--- a/Source/PathTracer.h
++++ b/Source/PathTracer.h
+@@ -28,6 +28,9 @@
+ #include "PortalList.h"
+ #include "RestirBuffers.h"
+ #include "Volumetric.h"
++#include "Generated/ShaderCommonC.h"
++
++#include <array>
+ 
+ namespace RTGL1
+ {
+@@ -88,6 +91,10 @@ private:
+ 
+ private:
+     std::shared_ptr<RayTracingPipeline> rtPipeline;
++
++    // Sets of the current frame, indexed by DESC_SET_RQ_*. Rebound before every pass,
++    // as other compute passes (denoisers etc.) share the compute bind point.
++    std::array< VkDescriptorSet, DESC_SET_RQ_COUNT > currentSets{};
+ };
+ 
+ }
+\ No newline at end of file
+diff --git a/Source/PhysicalDevice.cpp b/Source/PhysicalDevice.cpp
+index 2124c4c..7c840ef 100644
+--- a/Source/PhysicalDevice.cpp
++++ b/Source/PhysicalDevice.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include "PhysicalDevice.h"
+ 
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+@@ -28,7 +29,7 @@
+ using namespace RTGL1;
+ 
+ PhysicalDevice::PhysicalDevice(VkInstance instance)
+-    : physDevice(VK_NULL_HANDLE), memoryProperties{}, rtPipelineProperties{}, asProperties{}
++    : physDevice(VK_NULL_HANDLE), memoryProperties{}, asProperties{}
+ {
+     VkResult r;
+ 
+@@ -45,26 +46,37 @@ PhysicalDevice::PhysicalDevice(VkInstance instance)
+     r = vkEnumeratePhysicalDevices(instance, &physCount, physicalDevices.data());
+     VK_CHECKERROR(r);
+ 
++    // Ray query version: a device needs acceleration structures and ray queries,
++    // VK_KHR_ray_tracing_pipeline is not required (most Android GPUs don't expose it)
+     for (VkPhysicalDevice p : physicalDevices)
+     {
+-        VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtFeatures = {};
+-        rtFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
++        if (!IsExtensionSupported(p, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) ||
++            !IsExtensionSupported(p, VK_KHR_RAY_QUERY_EXTENSION_NAME) ||
++            !IsExtensionSupported(p, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
++        {
++            continue;
++        }
++
++        VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures = {};
++        rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
++
++        VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures = {};
++        asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
++        asFeatures.pNext = &rayQueryFeatures;
+ 
+         VkPhysicalDeviceFeatures2 deviceFeatures2 = {};
+         deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+-        deviceFeatures2.pNext = &rtFeatures;
++        deviceFeatures2.pNext = &asFeatures;
+         vkGetPhysicalDeviceFeatures2(p, &deviceFeatures2);
+ 
+-        if (rtFeatures.rayTracingPipeline)
++        if (rayQueryFeatures.rayQuery && asFeatures.accelerationStructure)
+         {
+             physDevice = p;
+ 
+-            rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+             asProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+             VkPhysicalDeviceProperties2 deviceProp2 = {};
+             deviceProp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+-            deviceProp2.pNext = &rtPipelineProperties;
+-            rtPipelineProperties.pNext = &asProperties;
++            deviceProp2.pNext = &asProperties;
+ 
+             vkGetPhysicalDeviceProperties2(physDevice, &deviceProp2);
+             vkGetPhysicalDeviceMemoryProperties(physDevice, &memoryProperties);
+@@ -75,10 +87,35 @@ PhysicalDevice::PhysicalDevice(VkInstance instance)
+ 
+     if (physDevice == VK_NULL_HANDLE)
+     {
+-        throw RgException(RG_CANT_FIND_PHYSICAL_DEVICE, "Can't find physical device with ray tracing support");
++        throw RgException(RG_CANT_FIND_PHYSICAL_DEVICE, "Can't find physical device with ray query support (VK_KHR_ray_query and VK_KHR_acceleration_structure)");
+     }
+ }
+ 
++bool PhysicalDevice::IsExtensionSupported(VkPhysicalDevice device, const char *extensionName)
++{
++    uint32_t count = 0;
++    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr) != VK_SUCCESS)
++    {
++        return false;
++    }
++
++    std::vector<VkExtensionProperties> exts(count);
++    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &count, exts.data()) != VK_SUCCESS)
++    {
++        return false;
++    }
++
++    for (const auto &e : exts)
++    {
++        if (std::strcmp(e.extensionName, extensionName) == 0)
++        {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ VkPhysicalDevice PhysicalDevice::Get() const
+ {
+     return physDevice;
+@@ -137,11 +174,6 @@ const VkPhysicalDeviceMemoryProperties &PhysicalDevice::GetMemoryProperties() co
+     return memoryProperties;
+ }
+ 
+-const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &PhysicalDevice::GetRTPipelineProperties() const
+-{
+-    return rtPipelineProperties;
+-}
+-
+ const VkPhysicalDeviceAccelerationStructurePropertiesKHR& PhysicalDevice::GetASProperties() const
+ {
+     return asProperties;
+diff --git a/Source/PhysicalDevice.h b/Source/PhysicalDevice.h
+index 4aa4a25..91f1047 100644
+--- a/Source/PhysicalDevice.h
++++ b/Source/PhysicalDevice.h
+@@ -39,14 +39,15 @@ public:
+     VkPhysicalDevice Get() const;
+     uint32_t GetMemoryTypeIndex(uint32_t memoryTypeBits, VkFlags requirementsMask) const;
+     const VkPhysicalDeviceMemoryProperties &GetMemoryProperties() const;
+-    const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &GetRTPipelineProperties() const;
+     const VkPhysicalDeviceAccelerationStructurePropertiesKHR& GetASProperties() const;
+ 
++    // true, if the device supports the extension
++    static bool IsExtensionSupported(VkPhysicalDevice device, const char *extensionName);
++
+ private:
+     // selected physical device
+     VkPhysicalDevice physDevice;
+     VkPhysicalDeviceMemoryProperties memoryProperties;
+-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties;
+     VkPhysicalDeviceAccelerationStructurePropertiesKHR asProperties;
+ };
+ 
+diff --git a/Source/PortalList.cpp b/Source/PortalList.cpp
+index 4e79d7b..393aa29 100644
+--- a/Source/PortalList.cpp
++++ b/Source/PortalList.cpp
+@@ -100,7 +100,7 @@ void RTGL1::PortalList::CreateDescriptors()
+         .binding = BINDING_PORTAL_INSTANCES,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+         .descriptorCount = 1,
+-        .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
++        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+     };
+ 
+     VkDescriptorSetLayoutCreateInfo layoutInfo =
+diff --git a/Source/RayTracingPipeline.cpp b/Source/RayTracingPipeline.cpp
+index dae34b2..33c5ad6 100644
+--- a/Source/RayTracingPipeline.cpp
++++ b/Source/RayTracingPipeline.cpp
+@@ -21,12 +21,29 @@
+ #include "RayTracingPipeline.h"
+ 
+ #include "Generated/ShaderCommonC.h"
++#include "Generated/ShaderCommonCFramebuf.h"
++#include "RgException.h"
+ #include "Utils.h"
++
+ #include <cstring>
+ #include <string>
++#include <vector>
+ 
+ using namespace RTGL1;
+ 
++namespace
++{
++
++// Must match RayQueryPush_BT in Shaders/RaygenCommon.h
++struct RayQueryPush
++{
++    uint32_t launchWidth;
++    uint32_t launchHeight;
++    uint32_t launchDepth;
++};
++
++}
++
+ RayTracingPipeline::RayTracingPipeline( VkDevice                           _device,
+                                         std::shared_ptr< PhysicalDevice >  _physDevice,
+                                         std::shared_ptr< MemoryAllocator > _allocator,
+@@ -43,354 +60,357 @@ RayTracingPipeline::RayTracingPipeline( VkDevice                           _devi
+                                         const Volumetric*                  _volumetric,
+                                         const RgInstanceCreateInfo&        _rgInfo )
+     : device( _device )
+-    , physDevice( std::move( _physDevice ) )
+-    , rtPipelineLayout( VK_NULL_HANDLE )
+-    , rtPipeline( VK_NULL_HANDLE )
+-    , copySBTFromStaging( false )
+-    , groupBaseAlignment( 0 )
+-    , handleSize( 0 )
+-    , alignedHandleSize( 0 )
+-    , raygenShaderCount( 0 )
+-    , hitGroupCount( 0 )
+-    , missShaderCount( 0 )
++    , combinedSetLayout( VK_NULL_HANDLE )
++    , combinedPool( VK_NULL_HANDLE )
++    , combinedSets{}
++    , pipelineLayout( VK_NULL_HANDLE )
++    , passInfos{}
++    , pipelines{}
+     , primaryRaysMaxAlbedoLayers( _rgInfo.primaryRaysMaxAlbedoLayers )
+     , indirectIlluminationMaxAlbedoLayers( _rgInfo.indirectIlluminationMaxAlbedoLayers )
+ {
+-    shaderBindingTable = std::make_shared<AutoBuffer>(device, std::move(_allocator));
+-
+-    // all set layouts to be used
+-    VkDescriptorSetLayout setLayouts[] = {
+-        // ray tracing acceleration structures
+-        _scene->GetASManager()->GetTLASDescSetLayout(),
+-        // storage images
+-        _framebuffers->GetDescSetLayout(),
+-        // uniform
+-        _uniform->GetDescSetLayout(),
+-        // vertex data
+-        _scene->GetASManager()->GetBuffersDescSetLayout(),
+-        // textures
+-        _textureManager->GetDescSetLayout(),
+-        // uniform random
+-        _blueNoise->GetDescSetLayout(),
+-        // light sources
+-        _scene->GetLightManager()->GetDescSetLayout(),
+-        // cubemaps, for a cubemap type of skyboxes
+-        _cubemapManager->GetDescSetLayout(),
+-        // dynamic cubemaps
+-        _renderCubemap->GetDescSetLayout(),
+-        // portals
+-        _portalList->GetDescSetLayout(),
+-        // device local buffers for restir
+-        _restirBuffers->GetDescSetLayout(),
+-        // device local buffers for volumetrics
+-        _volumetric->GetDescSetLayout(),
+-    };
+-
+-    CreatePipelineLayout(setLayouts, std::size(setLayouts));
++    // no shader binding table with ray queries
++    ( void )_allocator;
++
++    // mobile GPUs have much lower descriptor limits than desktop ones,
++    // and exceeding them is undefined behavior rather than an error, so check up front
++    CheckDeviceLimits( *_physDevice, _textureManager->GetMaxTextureCount() );
++
++    // TLAS, uniform, blue noise, cubemaps, render cubemap and portals are merged into one set;
++    // their layouts are recreated in CreateCombinedDescriptors()
++    ( void )_uniform;
++    ( void )_blueNoise;
++    ( void )_cubemapManager;
++    ( void )_renderCubemap;
++    ( void )_portalList;
++    CreateCombinedDescriptors();
++
++    // all set layouts to be used, indexed by DESC_SET_RQ_*
++    VkDescriptorSetLayout setLayouts[ DESC_SET_RQ_COUNT ] = {};
++    setLayouts[ DESC_SET_RQ_FRAMEBUFFERS ]    = _framebuffers->GetDescSetLayout();
++    setLayouts[ DESC_SET_RQ_VERTEX_DATA ]     = _scene->GetASManager()->GetBuffersDescSetLayout();
++    setLayouts[ DESC_SET_RQ_TEXTURES ]        = _textureManager->GetDescSetLayout();
++    setLayouts[ DESC_SET_RQ_LIGHT_SOURCES ]   = _scene->GetLightManager()->GetDescSetLayout();
++    setLayouts[ DESC_SET_RQ_RESTIR_INDIRECT ] = _restirBuffers->GetDescSetLayout();
++    setLayouts[ DESC_SET_RQ_VOLUMETRIC ]      = _volumetric->GetDescSetLayout();
++    setLayouts[ DESC_SET_RQ_COMBINED ]        = combinedSetLayout;
++
++    CreatePipelineLayout( setLayouts, std::size( setLayouts ) );
++
++    assert( primaryRaysMaxAlbedoLayers <= MATERIALS_MAX_LAYER_COUNT );
++    assert( indirectIlluminationMaxAlbedoLayers <= MATERIALS_MAX_LAYER_COUNT );
++
++    // indexed by the former SBT_INDEX_RAYGEN_* values, so the callers stay the same
++    static_assert( SBT_INDEX_RAYGEN_PRIMARY < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_REFL_REFR < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_DIRECT < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_INDIRECT_INIT < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_INDIRECT_FINAL < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_GRADIENTS < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_INITIAL_RESERVOIRS < PASS_COUNT );
++    static_assert( SBT_INDEX_RAYGEN_VOLUMETRIC < PASS_COUNT );
++
++    passInfos[ SBT_INDEX_RAYGEN_PRIMARY ]            = { "RGenPrimary", &primaryRaysMaxAlbedoLayers };
++    passInfos[ SBT_INDEX_RAYGEN_REFL_REFR ]          = { "RGenReflRefr", &primaryRaysMaxAlbedoLayers };
++    passInfos[ SBT_INDEX_RAYGEN_DIRECT ]             = { "RGenDirect", nullptr };
++    passInfos[ SBT_INDEX_RAYGEN_INDIRECT_INIT ]      = { "RGenIndirectInit", &indirectIlluminationMaxAlbedoLayers };
++    passInfos[ SBT_INDEX_RAYGEN_INDIRECT_FINAL ]     = { "RGenIndirectFinal", &indirectIlluminationMaxAlbedoLayers };
++    passInfos[ SBT_INDEX_RAYGEN_GRADIENTS ]          = { "RGenGradients", nullptr };
++    passInfos[ SBT_INDEX_RAYGEN_INITIAL_RESERVOIRS ] = { "RInitialReservoirs", nullptr };
++    passInfos[ SBT_INDEX_RAYGEN_VOLUMETRIC ]         = { "RVolumetric", nullptr };
++
++    CreatePipelines( _shaderManager );
++}
+ 
+-    assert(primaryRaysMaxAlbedoLayers <= MATERIALS_MAX_LAYER_COUNT);
+-    assert(indirectIlluminationMaxAlbedoLayers <= MATERIALS_MAX_LAYER_COUNT);
++RayTracingPipeline::~RayTracingPipeline()
++{
++    DestroyPipelines();
++    vkDestroyPipelineLayout( device, pipelineLayout, nullptr );
++    vkDestroyDescriptorPool( device, combinedPool, nullptr );
++    vkDestroyDescriptorSetLayout( device, combinedSetLayout, nullptr );
++}
+ 
+-    // shader modules in the pipeline will have the exact order
+-    shaderStageInfos =
++void RayTracingPipeline::CheckDeviceLimits( const PhysicalDevice& physDevice,
++                                            uint32_t              maxTextureCount ) const
++{
++    VkPhysicalDeviceProperties props = {};
++    vkGetPhysicalDeviceProperties( physDevice.Get(), &props );
++    const VkPhysicalDeviceLimits& lim = props.limits;
++
++    // Upper bounds of the descriptors visible to the compute stage of the ray query pipeline layout:
++    //  framebuffers:   ShFramebuffers_Count storage images + ShFramebuffers_Count combined image samplers
++    //  vertex data:    8 storage buffers (ASManager)
++    //  textures:       maxTextureCount combined image samplers
++    //  light sources:  6 storage buffers
++    //  restir:         3 storage buffers
++    //  volumetric:     2 storage images + 3 combined image samplers
++    //  combined set:   1 acceleration structure, 2 uniform buffers (global, portals),
++    //                  1 sampled image (blue noise), MAX_CUBEMAP_COUNT + 1 combined image samplers
++    const uint32_t storageImages    = ShFramebuffers_Count + 2;
++    const uint32_t combinedSamplers = ShFramebuffers_Count + maxTextureCount + 3 + MAX_CUBEMAP_COUNT + 1;
++    const uint32_t sampledImages    = combinedSamplers + 1;
++    const uint32_t samplers         = combinedSamplers;
++    const uint32_t storageBuffers   = 8 + 6 + 3;
++    const uint32_t uniformBuffers   = 2;
++    const uint32_t resources        = storageImages + sampledImages + storageBuffers + uniformBuffers;
++
++    struct Check
+     {
+-        { "RGenPrimary",            &primaryRaysMaxAlbedoLayers },
+-        { "RGenReflRefr",           &primaryRaysMaxAlbedoLayers },
+-        { "RGenDirect",             nullptr },
+-        { "RGenIndirectInit",       &indirectIlluminationMaxAlbedoLayers },
+-        { "RGenIndirectFinal",      &indirectIlluminationMaxAlbedoLayers },
+-        { "RGenGradients",          nullptr },
+-        { "RInitialReservoirs",     nullptr },
+-        { "RVolumetric",            nullptr },
+-        { "RMiss",                  nullptr },
+-        { "RMissShadow",            nullptr },
+-        { "RClsOpaque",             nullptr },
+-        { "RAlphaTest",             nullptr },
++        uint32_t    needed;
++        uint32_t    limit;
++        const char* name;
++    };
++    const Check checks[] = {
++        { DESC_SET_RQ_COUNT, lim.maxBoundDescriptorSets, "maxBoundDescriptorSets" },
++        { storageImages, lim.maxPerStageDescriptorStorageImages, "maxPerStageDescriptorStorageImages" },
++        { sampledImages, lim.maxPerStageDescriptorSampledImages, "maxPerStageDescriptorSampledImages" },
++        { samplers, lim.maxPerStageDescriptorSamplers, "maxPerStageDescriptorSamplers" },
++        { storageBuffers, lim.maxPerStageDescriptorStorageBuffers, "maxPerStageDescriptorStorageBuffers" },
++        { uniformBuffers, lim.maxPerStageDescriptorUniformBuffers, "maxPerStageDescriptorUniformBuffers" },
++        { resources, lim.maxPerStageResources, "maxPerStageResources" },
++        { COMPUTE_RAY_QUERY_GROUP_SIZE_X * COMPUTE_RAY_QUERY_GROUP_SIZE_Y,
++          lim.maxComputeWorkGroupInvocations,
++          "maxComputeWorkGroupInvocations" },
++        { static_cast< uint32_t >( sizeof( RayQueryPush ) ),
++          lim.maxPushConstantsSize,
++          "maxPushConstantsSize" },
+     };
+ 
+-#pragma region Utilities
+-    // simple lambda to get index in "stages" by name
+-    auto toIndex = [this] (const char *shaderName)
++    for( const Check& c : checks )
+     {
+-        for (uint32_t i = 0; i < shaderStageInfos.size(); i++)
++        if( c.needed > c.limit )
+         {
+-            if (std::strcmp(shaderName, shaderStageInfos[i].pName) == 0)
+-            {
+-                return i;
+-            }
++            using namespace std::string_literals;
++            throw RgException( RG_CANT_FIND_PHYSICAL_DEVICE,
++                               "Device limit "s + c.name + " is " + std::to_string( c.limit ) +
++                                   ", but the ray query path tracer needs " +
++                                   std::to_string( c.needed ) + " (bindless texture array: " +
++                                   std::to_string( maxTextureCount ) + ")" );
+         }
++    }
++}
+ 
+-        assert(0);
+-        return UINT32_MAX;
++void RayTracingPipeline::CreateCombinedDescriptors()
++{
++    // Types and counts must match the source sets' layouts:
++    // ASManager (TLAS), GlobalUniform, BlueNoise, CubemapManager, RenderCubemap, PortalList
++    std::vector< VkDescriptorSetLayoutBinding > bindings;
++
++    auto add = [ &bindings ]( uint32_t binding, VkDescriptorType type, uint32_t count ) {
++        VkDescriptorSetLayoutBinding b = {};
++        b.binding                      = binding;
++        b.descriptorType               = type;
++        b.descriptorCount              = count;
++        b.stageFlags                   = VK_SHADER_STAGE_COMPUTE_BIT;
++        bindings.push_back( b );
+     };
+-#pragma endregion
+ 
++    add( BINDING_RQ_ACCELERATION_STRUCTURE_MAIN, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 );
++    add( BINDING_RQ_GLOBAL_UNIFORM, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 );
++    add( BINDING_RQ_BLUE_NOISE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1 );
++    add( BINDING_RQ_CUBEMAPS, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_CUBEMAP_COUNT );
++    add( BINDING_RQ_RENDER_CUBEMAP, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 );
++    add( BINDING_RQ_PORTAL_INSTANCES, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 );
++
++    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
++    layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    layoutInfo.bindingCount = static_cast< uint32_t >( bindings.size() );
++    layoutInfo.pBindings    = bindings.data();
++
++    VkResult r = vkCreateDescriptorSetLayout( device, &layoutInfo, nullptr, &combinedSetLayout );
++    VK_CHECKERROR( r );
++
++    SET_DEBUG_NAME( device,
++                    combinedSetLayout,
++                    VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
++                    "Ray query combined Desc set layout" );
++
++    VkDescriptorPoolSize poolSizes[] = {
++        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 * MAX_FRAMES_IN_FLIGHT },
++        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * MAX_FRAMES_IN_FLIGHT },
++        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1 * MAX_FRAMES_IN_FLIGHT },
++        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ( MAX_CUBEMAP_COUNT + 1 ) * MAX_FRAMES_IN_FLIGHT },
++    };
+ 
+-    // set shader binding table structure the same as defined with SBT_INDEX_* 
+-
+-    AddRayGenGroup(toIndex("RGenPrimary"));                         assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_PRIMARY);
+-    AddRayGenGroup(toIndex("RGenReflRefr"));                        assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_REFL_REFR);
+-    AddRayGenGroup(toIndex("RGenDirect"));                          assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_DIRECT);
+-    AddRayGenGroup(toIndex("RGenIndirectInit"));                    assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_INDIRECT_INIT);
+-    AddRayGenGroup(toIndex("RGenIndirectFinal"));                   assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_INDIRECT_FINAL);
+-    AddRayGenGroup(toIndex("RGenGradients"));                       assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_GRADIENTS);
+-    AddRayGenGroup(toIndex("RInitialReservoirs"));                  assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_INITIAL_RESERVOIRS);
+-    AddRayGenGroup(toIndex("RVolumetric"));                         assert(raygenShaderCount - 1 == SBT_INDEX_RAYGEN_VOLUMETRIC);
++    VkDescriptorPoolCreateInfo poolInfo = {};
++    poolInfo.sType                      = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    poolInfo.maxSets                    = MAX_FRAMES_IN_FLIGHT;
++    poolInfo.poolSizeCount              = static_cast< uint32_t >( std::size( poolSizes ) );
++    poolInfo.pPoolSizes                 = poolSizes;
+ 
+-    AddMissGroup(toIndex("RMiss"));                                 assert(missShaderCount - 1 == SBT_INDEX_MISS_DEFAULT);
+-    AddMissGroup(toIndex("RMissShadow"));                           assert(missShaderCount - 1 == SBT_INDEX_MISS_SHADOW);
++    r = vkCreateDescriptorPool( device, &poolInfo, nullptr, &combinedPool );
++    VK_CHECKERROR( r );
+ 
+-    // only opaque
+-    AddHitGroup(toIndex("RClsOpaque"));                             assert(hitGroupCount - 1 == SBT_INDEX_HITGROUP_FULLY_OPAQUE);
+-    // alpha tested and then opaque
+-    AddHitGroup(toIndex("RClsOpaque"), toIndex("RAlphaTest"));      assert(hitGroupCount - 1 == SBT_INDEX_HITGROUP_ALPHA_TESTED);
++    SET_DEBUG_NAME(
++        device, combinedPool, VK_OBJECT_TYPE_DESCRIPTOR_POOL, "Ray query combined Desc pool" );
+ 
+-    CreatePipeline( _shaderManager );
+-    CreateSBT();
++    for( uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++ )
++    {
++        VkDescriptorSetAllocateInfo allocInfo = {};
++        allocInfo.sType                       = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++        allocInfo.descriptorPool              = combinedPool;
++        allocInfo.descriptorSetCount          = 1;
++        allocInfo.pSetLayouts                 = &combinedSetLayout;
++
++        r = vkAllocateDescriptorSets( device, &allocInfo, &combinedSets[ i ] );
++        VK_CHECKERROR( r );
++
++        SET_DEBUG_NAME( device,
++                        combinedSets[ i ],
++                        VK_OBJECT_TYPE_DESCRIPTOR_SET,
++                        "Ray query combined Desc set" );
++    }
+ }
+ 
+-RayTracingPipeline::~RayTracingPipeline()
++VkDescriptorSet RayTracingPipeline::UpdateCombinedDescSet( uint32_t                  frameIndex,
++                                                           const CombinedSetSources& src )
+ {
+-    DestroyPipeline();
+-    vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
++    assert( frameIndex < MAX_FRAMES_IN_FLIGHT );
++    VkDescriptorSet dst = combinedSets[ frameIndex ];
++
++    std::vector< VkCopyDescriptorSet > copies;
++    copies.reserve( 6 );
++
++    auto copy = [ &copies, dst ]( VkDescriptorSet srcSet,
++                                  uint32_t        srcBinding,
++                                  uint32_t        dstBinding,
++                                  uint32_t        count ) {
++        VkCopyDescriptorSet c = {};
++        c.sType               = VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET;
++        c.srcSet              = srcSet;
++        c.srcBinding          = srcBinding;
++        c.srcArrayElement     = 0;
++        c.dstSet              = dst;
++        c.dstBinding          = dstBinding;
++        c.dstArrayElement     = 0;
++        c.descriptorCount     = count;
++        copies.push_back( c );
++    };
++
++    // original bindings: see the source managers; remapped ones: BINDING_RQ_*
++    copy( src.tlas, BINDING_ACCELERATION_STRUCTURE_MAIN, BINDING_RQ_ACCELERATION_STRUCTURE_MAIN, 1 );
++    copy( src.uniform, BINDING_GLOBAL_UNIFORM, BINDING_RQ_GLOBAL_UNIFORM, 1 );
++    copy( src.blueNoise, BINDING_BLUE_NOISE, BINDING_RQ_BLUE_NOISE, 1 );
++    copy( src.cubemaps, BINDING_CUBEMAPS, BINDING_RQ_CUBEMAPS, MAX_CUBEMAP_COUNT );
++    copy( src.renderCubemap, BINDING_RENDER_CUBEMAP, BINDING_RQ_RENDER_CUBEMAP, 1 );
++    copy( src.portals, BINDING_PORTAL_INSTANCES, BINDING_RQ_PORTAL_INSTANCES, 1 );
++
++    vkUpdateDescriptorSets(
++        device, 0, nullptr, static_cast< uint32_t >( copies.size() ), copies.data() );
++
++    return dst;
+ }
+ 
+-void RayTracingPipeline::CreatePipelineLayout(const VkDescriptorSetLayout *pSetLayouts, uint32_t setLayoutCount)
++void RayTracingPipeline::CreatePipelineLayout( const VkDescriptorSetLayout* pSetLayouts,
++                                               uint32_t                     setLayoutCount )
+ {
++    VkPushConstantRange pushRange = {};
++    pushRange.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
++    pushRange.offset              = 0;
++    pushRange.size                = sizeof( RayQueryPush );
++
+     VkPipelineLayoutCreateInfo plLayoutInfo = {};
+-    plLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+-    plLayoutInfo.setLayoutCount = setLayoutCount;
+-    plLayoutInfo.pSetLayouts = pSetLayouts;
++    plLayoutInfo.sType                      = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    plLayoutInfo.setLayoutCount             = setLayoutCount;
++    plLayoutInfo.pSetLayouts                = pSetLayouts;
++    plLayoutInfo.pushConstantRangeCount     = 1;
++    plLayoutInfo.pPushConstantRanges        = &pushRange;
+ 
+-    VkResult r = vkCreatePipelineLayout(device, &plLayoutInfo, nullptr, &rtPipelineLayout);
+-    VK_CHECKERROR(r);
++    VkResult r = vkCreatePipelineLayout( device, &plLayoutInfo, nullptr, &pipelineLayout );
++    VK_CHECKERROR( r );
+ 
+-    SET_DEBUG_NAME(device, rtPipelineLayout, VK_OBJECT_TYPE_PIPELINE_LAYOUT, "Ray tracing pipeline Layout");
++    SET_DEBUG_NAME(
++        device, pipelineLayout, VK_OBJECT_TYPE_PIPELINE_LAYOUT, "Ray query pipeline layout" );
+ }
+ 
+-void RayTracingPipeline::CreatePipeline(const ShaderManager *shaderManager)
++void RayTracingPipeline::CreatePipelines( const ShaderManager* shaderManager )
+ {
+-    std::vector<VkPipelineShaderStageCreateInfo> stages(shaderStageInfos.size());
++    for( uint32_t i = 0; i < PASS_COUNT; i++ )
++    {
++        const PassInfo& pass = passInfos[ i ];
++        assert( pass.pShaderName != nullptr );
+ 
+-    // for optional specialization constants,
+-    // pre-allocate whole vector to prevent wrong pointers in pSpecializationInfo
+-    std::vector<VkSpecializationMapEntry> specEntries(shaderStageInfos.size());
+-    std::vector<VkSpecializationInfo> specInfos(shaderStageInfos.size());
++        VkSpecializationMapEntry specEntry = {};
++        VkSpecializationInfo     specInfo  = {};
+ 
+-    for (uint32_t i = 0; i < shaderStageInfos.size(); i++)
+-    {
+-        stages[i] = shaderManager->GetStageInfo(shaderStageInfos[i].pName);
++        VkComputePipelineCreateInfo pipelineInfo = {};
++        pipelineInfo.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
++        pipelineInfo.stage  = shaderManager->GetStageInfo( pass.pShaderName );
++        pipelineInfo.layout = pipelineLayout;
+ 
+-        if (shaderStageInfos[i].pSpecConst != nullptr)
++        if( pipelineInfo.stage.stage != VK_SHADER_STAGE_COMPUTE_BIT )
++        {
++            using namespace std::string_literals;
++            throw RgException( RG_GRAPHICS_API_ERROR,
++                               "Ray query pass \""s + pass.pShaderName +
++                                   "\" must be a compute shader" );
++        }
++
++        if( pass.pSpecConst != nullptr )
+         {
+-            VkSpecializationMapEntry &specEntry = specEntries[i];
+             specEntry.constantID = 0;
+-            specEntry.offset = 0;
+-            specEntry.size = sizeof(uint32_t);
++            specEntry.offset     = 0;
++            specEntry.size       = sizeof( uint32_t );
+ 
+-            VkSpecializationInfo &specInfo = specInfos[i];
+             specInfo.mapEntryCount = 1;
+-            specInfo.pMapEntries = &specEntry;
+-            specInfo.dataSize = sizeof(*shaderStageInfos[i].pSpecConst);
+-            specInfo.pData = shaderStageInfos[i].pSpecConst;
++            specInfo.pMapEntries   = &specEntry;
++            specInfo.dataSize      = sizeof( *pass.pSpecConst );
++            specInfo.pData         = pass.pSpecConst;
+ 
+-            stages[i].pSpecializationInfo = &specInfo;
++            pipelineInfo.stage.pSpecializationInfo = &specInfo;
+         }
+-    }
+ 
+-    VkPipelineLibraryCreateInfoKHR libInfo = {};
+-    libInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
++        VkResult r = vkCreateComputePipelines(
++            device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipelines[ i ] );
++        VK_CHECKERROR( r );
+ 
+-    VkRayTracingPipelineCreateInfoKHR pipelineInfo = {};
+-    pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+-    pipelineInfo.stageCount = stages.size();
+-    pipelineInfo.pStages = stages.data();
+-    pipelineInfo.groupCount = shaderGroups.size();
+-    pipelineInfo.pGroups = shaderGroups.data();
+-    pipelineInfo.maxPipelineRayRecursionDepth = 2;
+-    pipelineInfo.layout = rtPipelineLayout;
+-    pipelineInfo.pLibraryInfo = &libInfo;
+-
+-    VkResult r = svkCreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &rtPipeline);
+-    VK_CHECKERROR(r);
+-
+-    SET_DEBUG_NAME(device, rtPipeline, VK_OBJECT_TYPE_PIPELINE, "Ray tracing pipeline");
+-}
+-
+-void RayTracingPipeline::DestroyPipeline()
+-{
+-    vkDestroyPipeline(device, rtPipeline, nullptr);
+-    rtPipeline = VK_NULL_HANDLE;
++        SET_DEBUG_NAME( device, pipelines[ i ], VK_OBJECT_TYPE_PIPELINE, pass.pShaderName );
++    }
+ }
+ 
+-void RayTracingPipeline::CreateSBT()
++void RayTracingPipeline::DestroyPipelines()
+ {
+-    VkResult r;
+-
+-    uint32_t groupCount = shaderGroups.size();
+-    groupBaseAlignment = physDevice->GetRTPipelineProperties().shaderGroupBaseAlignment;
+-
+-    handleSize = physDevice->GetRTPipelineProperties().shaderGroupHandleSize;
+-    alignedHandleSize = Utils::Align(handleSize, groupBaseAlignment);
+-
+-    uint32_t sbtSize = alignedHandleSize * groupCount;
+-
+-    shaderBindingTable->Create(
+-        sbtSize,
+-        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 
+-        "SBT",
+-        1);
+-
+-    std::vector<uint8_t> shaderHandles(handleSize * groupCount);
+-    r = svkGetRayTracingShaderGroupHandlesKHR(device, rtPipeline, 0, groupCount, shaderHandles.size(), shaderHandles.data());
+-    VK_CHECKERROR(r);
+-
+-    uint8_t *mapped = (uint8_t *) shaderBindingTable->GetMapped(0);
+-
+-    for (uint32_t i = 0; i < groupCount; i++)
++    for( VkPipeline& p : pipelines )
+     {
+-        memcpy(
+-            mapped + i * alignedHandleSize, 
+-            shaderHandles.data() + i * handleSize,
+-            handleSize);
++        vkDestroyPipeline( device, p, nullptr );
++        p = VK_NULL_HANDLE;
+     }
+-
+-    copySBTFromStaging = true;
+ }
+ 
+-void RayTracingPipeline::DestroySBT()
++void RayTracingPipeline::TraceRays(
++    VkCommandBuffer cmd, uint32_t passIndex, uint32_t width, uint32_t height, uint32_t depth )
+ {
+-    shaderBindingTable->Destroy();
+-}
++    assert( passIndex < PASS_COUNT );
++    assert( pipelines[ passIndex ] != VK_NULL_HANDLE );
+ 
+-void RayTracingPipeline::Bind(VkCommandBuffer cmd)
+-{
+-    if (copySBTFromStaging)
++    if( width == 0 || height == 0 || depth == 0 )
+     {
+-        shaderBindingTable->CopyFromStaging(cmd, 0);
+-        copySBTFromStaging = false;
++        return;
+     }
+ 
+-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtPipeline);
+-}
+-
+-void RayTracingPipeline::GetEntries(
+-    uint32_t sbtRayGenIndex,
+-    VkStridedDeviceAddressRegionKHR &raygenEntry,
+-    VkStridedDeviceAddressRegionKHR &missEntry,
+-    VkStridedDeviceAddressRegionKHR &hitEntry,
+-    VkStridedDeviceAddressRegionKHR &callableEntry) const
+-{
+-    assert( sbtRayGenIndex == SBT_INDEX_RAYGEN_PRIMARY ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_REFL_REFR ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_DIRECT ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_INDIRECT_INIT ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_INDIRECT_FINAL ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_GRADIENTS ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_INITIAL_RESERVOIRS ||
+-            sbtRayGenIndex == SBT_INDEX_RAYGEN_VOLUMETRIC );
+-
+-    VkDeviceAddress bufferAddress = shaderBindingTable->GetDeviceAddress();
+-
+-    uint64_t offset = 0;
+-
++    vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[ passIndex ] );
+ 
+-    raygenEntry = {};
+-    raygenEntry.deviceAddress = bufferAddress + offset + (uint64_t)sbtRayGenIndex * alignedHandleSize;
+-    raygenEntry.stride = alignedHandleSize;
+-    raygenEntry.size = alignedHandleSize;
+-    // vk spec
+-    assert(raygenEntry.size == raygenEntry.stride);
++    RayQueryPush push = {};
++    push.launchWidth  = width;
++    push.launchHeight = height;
++    push.launchDepth  = depth;
+ 
+-    offset += (uint64_t)raygenShaderCount * alignedHandleSize;
++    vkCmdPushConstants(
++        cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( push ), &push );
+ 
+-
+-    missEntry = {};
+-    missEntry.deviceAddress = bufferAddress + offset;
+-    missEntry.stride = alignedHandleSize;
+-    missEntry.size = (uint64_t)missShaderCount * alignedHandleSize;
+-
+-    offset += (uint64_t)missShaderCount * alignedHandleSize;
+-
+-
+-    hitEntry = {};
+-    hitEntry.deviceAddress = bufferAddress + offset;
+-    hitEntry.stride = alignedHandleSize;
+-    hitEntry.size = (uint64_t)hitGroupCount * alignedHandleSize;
+-
+-    offset += (uint64_t)hitGroupCount * alignedHandleSize;
+-
+-
+-    callableEntry = {};
++    vkCmdDispatch( cmd,
++                   Utils::GetWorkGroupCount( width, COMPUTE_RAY_QUERY_GROUP_SIZE_X ),
++                   Utils::GetWorkGroupCount( height, COMPUTE_RAY_QUERY_GROUP_SIZE_Y ),
++                   depth );
+ }
+ 
+ VkPipelineLayout RayTracingPipeline::GetLayout() const
+ {
+-    return rtPipelineLayout;
+-}
+-
+-void RayTracingPipeline::OnShaderReload(const ShaderManager *shaderManager)
+-{
+-    DestroySBT();
+-    DestroyPipeline();
+-
+-    CreatePipeline(shaderManager);
+-    CreateSBT();
+-}
+-
+-void RayTracingPipeline::AddGeneralGroup(uint32_t generalIndex)
+-{
+-    VkRayTracingShaderGroupCreateInfoKHR group = {};
+-    group.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+-    group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+-    group.generalShader = generalIndex;
+-    group.closestHitShader = VK_SHADER_UNUSED_KHR;
+-    group.anyHitShader = VK_SHADER_UNUSED_KHR;
+-    group.intersectionShader = VK_SHADER_UNUSED_KHR;
+-
+-    shaderGroups.push_back(group);
+-}
+-
+-void RayTracingPipeline::AddRayGenGroup(uint32_t raygenIndex)
+-{
+-    AddGeneralGroup(raygenIndex);
+-
+-    raygenShaderCount++;
+-}
+-
+-void RayTracingPipeline::AddMissGroup(uint32_t missIndex)
+-{
+-    AddGeneralGroup(missIndex);
+-
+-    missShaderCount++;
+-}
+-
+-void RayTracingPipeline::AddHitGroup(uint32_t closestHitIndex)
+-{
+-    AddHitGroup(closestHitIndex, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR);
+-}
+-
+-void RayTracingPipeline::AddHitGroupOnlyAny(uint32_t anyHitIndex)
+-{
+-    AddHitGroup(VK_SHADER_UNUSED_KHR, anyHitIndex, VK_SHADER_UNUSED_KHR);
++    return pipelineLayout;
+ }
+ 
+-void RayTracingPipeline::AddHitGroup(uint32_t closestHitIndex, uint32_t anyHitIndex)
++void RayTracingPipeline::OnShaderReload( const ShaderManager* shaderManager )
+ {
+-    AddHitGroup(closestHitIndex, anyHitIndex, VK_SHADER_UNUSED_KHR);
+-}
+-
+-void RayTracingPipeline::AddHitGroup(uint32_t closestHitIndex, uint32_t anyHitIndex, uint32_t intersectionIndex)
+-{
+-    VkRayTracingShaderGroupCreateInfoKHR group = {};
+-    group.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+-    group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+-    group.generalShader = VK_SHADER_UNUSED_KHR;
+-    group.closestHitShader = closestHitIndex;
+-    group.anyHitShader = anyHitIndex;
+-    group.intersectionShader = intersectionIndex;
+-
+-    shaderGroups.push_back(group);
+-
+-    hitGroupCount++;
++    DestroyPipelines();
++    CreatePipelines( shaderManager );
+ }
+diff --git a/Source/RayTracingPipeline.h b/Source/RayTracingPipeline.h
+index a1fcae1..0e713fb 100644
+--- a/Source/RayTracingPipeline.h
++++ b/Source/RayTracingPipeline.h
+@@ -31,9 +31,15 @@
+ #include "RestirBuffers.h"
+ #include "Volumetric.h"
+ 
++#include <array>
++
+ namespace RTGL1
+ {
+ 
++// Ray query version of the path tracing passes.
++// Each former raygen shader is a compute shader that traces rays inline
++// with rayQueryEXT, so only VK_KHR_ray_query is required, not VK_KHR_ray_tracing_pipeline.
++// Pass indices are the old SBT_INDEX_RAYGEN_* values.
+ class RayTracingPipeline : public IShaderDependency
+ {
+ public:
+@@ -54,68 +60,65 @@ public:
+                         const RgInstanceCreateInfo&        rgInfo );
+     ~RayTracingPipeline() override;
+ 
+-    RayTracingPipeline(const RayTracingPipeline& other) = delete;
+-    RayTracingPipeline(RayTracingPipeline&& other) noexcept = delete;
+-    RayTracingPipeline& operator=(const RayTracingPipeline& other) = delete;
+-    RayTracingPipeline& operator=(RayTracingPipeline&& other) noexcept = delete;
++    RayTracingPipeline( const RayTracingPipeline& other )                = delete;
++    RayTracingPipeline( RayTracingPipeline&& other ) noexcept            = delete;
++    RayTracingPipeline& operator=( const RayTracingPipeline& other )     = delete;
++    RayTracingPipeline& operator=( RayTracingPipeline&& other ) noexcept = delete;
+ 
+-    void Bind(VkCommandBuffer cmd);
++    // Descriptor sets that are merged into one set for the ray query passes,
++    // as mobile GPUs can bind few sets at once (maxBoundDescriptorSets: Adreno 8, Turnip 7).
++    struct CombinedSetSources
++    {
++        VkDescriptorSet tlas;
++        VkDescriptorSet uniform;
++        VkDescriptorSet blueNoise;
++        VkDescriptorSet cubemaps;
++        VkDescriptorSet renderCubemap;
++        VkDescriptorSet portals;
++    };
+ 
+-    void GetEntries(uint32_t sbtRayGenIndex,
+-                    VkStridedDeviceAddressRegionKHR &raygenEntry,
+-                    VkStridedDeviceAddressRegionKHR &missEntry,
+-                    VkStridedDeviceAddressRegionKHR &hitEntry,
+-                    VkStridedDeviceAddressRegionKHR &callableEntry) const;
+-    VkPipelineLayout GetLayout() const;
+-    
+-    void OnShaderReload(const ShaderManager *shaderManager) override;
++    // Copy the current descriptors of the sources into this frame's combined set.
++    // Must be called each frame before the set is bound.
++    VkDescriptorSet UpdateCombinedDescSet( uint32_t frameIndex, const CombinedSetSources& sources );
+ 
+-private:
+-    void CreatePipelineLayout(const VkDescriptorSetLayout *pSetLayouts, uint32_t setLayoutCount);
++    // Bind the pass's compute pipeline, push the launch size and dispatch
++    // enough workgroups to cover width x height x depth.
++    // Descriptor sets must be bound to VK_PIPELINE_BIND_POINT_COMPUTE with GetLayout() beforehand.
++    void TraceRays(
++        VkCommandBuffer cmd, uint32_t passIndex, uint32_t width, uint32_t height, uint32_t depth );
+ 
+-    void CreatePipeline(const ShaderManager *shaderManager);
+-    void DestroyPipeline();
+-    void CreateSBT();
+-    void DestroySBT();
++    VkPipelineLayout GetLayout() const;
+ 
+-    void AddGeneralGroup(uint32_t generalIndex);
++    void OnShaderReload( const ShaderManager* shaderManager ) override;
+ 
+-    void AddRayGenGroup(uint32_t raygenIndex);
+-    void AddMissGroup(uint32_t missIndex);
+-    void AddHitGroup(uint32_t closestHitIndex);
+-    void AddHitGroupOnlyAny(uint32_t anyHitIndex);
+-    void AddHitGroup(uint32_t closestHitIndex, uint32_t anyHitIndex);
+-    void AddHitGroup(uint32_t closestHitIndex, uint32_t anyHitIndex, uint32_t intersectionIndex);
++private:
++    void CheckDeviceLimits( const PhysicalDevice& physDevice, uint32_t maxTextureCount ) const;
++    void CreateCombinedDescriptors();
++    void CreatePipelineLayout( const VkDescriptorSetLayout* pSetLayouts, uint32_t setLayoutCount );
++    void CreatePipelines( const ShaderManager* shaderManager );
++    void DestroyPipelines();
+ 
+ private:
+-    struct ShaderStageInfo
++    struct PassInfo
+     {
+-        const char *pName;
++        const char* pShaderName;
+         // One uint specialization const to use in the shader. Can be null.
+         // Otherwise, must exist throughout class lifetime.
+-        uint32_t *pSpecConst;
++        uint32_t* pSpecConst;
+     };
+ 
++    static constexpr uint32_t PASS_COUNT = 8;
++
+ private:
+     VkDevice device;
+-    std::shared_ptr<PhysicalDevice> physDevice;
+-
+-    std::vector<ShaderStageInfo> shaderStageInfos;
+-
+-    std::vector<VkRayTracingShaderGroupCreateInfoKHR> shaderGroups;
+-    VkPipelineLayout rtPipelineLayout;
+-    VkPipeline rtPipeline;
+-
+-    std::shared_ptr<AutoBuffer> shaderBindingTable;
+-    bool copySBTFromStaging;
+ 
+-    uint32_t groupBaseAlignment;
+-    uint32_t handleSize;
+-    uint32_t alignedHandleSize;
++    VkDescriptorSetLayout combinedSetLayout;
++    VkDescriptorPool      combinedPool;
++    VkDescriptorSet       combinedSets[ MAX_FRAMES_IN_FLIGHT ];
+ 
+-    uint32_t raygenShaderCount;
+-    uint32_t hitGroupCount;
+-    uint32_t missShaderCount;
++    VkPipelineLayout                     pipelineLayout;
++    std::array< PassInfo, PASS_COUNT >   passInfos;
++    std::array< VkPipeline, PASS_COUNT > pipelines;
+ 
+     uint32_t primaryRaysMaxAlbedoLayers;
+     uint32_t indirectIlluminationMaxAlbedoLayers;
+diff --git a/Source/RestirBuffers.cpp b/Source/RestirBuffers.cpp
+index 7deeaa8..9b7b284 100644
+--- a/Source/RestirBuffers.cpp
++++ b/Source/RestirBuffers.cpp
+@@ -42,10 +42,10 @@ void RTGL1::RestirBuffers::BarrierInitial( VkCommandBuffer cmd )
+     VkBufferMemoryBarrier2 b = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+         .srcStageMask =
+-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
++            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+         .dstStageMask =
+-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
++            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+         .dstAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT,
+         .srcQueueFamilyIndex = 0,
+         .dstQueueFamilyIndex = 0,
+@@ -161,19 +161,19 @@ void RTGL1::RestirBuffers::CreateDescriptors()
+             .binding = BINDING_RESTIR_INDIRECT_INITIAL_SAMPLES,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             .descriptorCount = 1,
+-            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT,
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         },
+         {
+             .binding = BINDING_RESTIR_INDIRECT_RESERVOIRS,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             .descriptorCount = 1,
+-            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT,
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         },
+         {
+             .binding = BINDING_RESTIR_INDIRECT_RESERVOIRS_PREV,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+             .descriptorCount = 1,
+-            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT,
++            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         },
+     };
+ 
+diff --git a/Source/ShaderManager.cpp b/Source/ShaderManager.cpp
+index 5a2778b..47e20e0 100644
+--- a/Source/ShaderManager.cpp
++++ b/Source/ShaderManager.cpp
+@@ -38,18 +38,14 @@ struct ShaderModuleDefinition
+ // Note: set shader stage to VK_SHADER_STAGE_ALL, to identify stage by the file extension
+ static ShaderModuleDefinition G_SHADERS[] =
+ {
+-    {"RGenPrimary",             "RtRaygenPrimary.rgen.spv"             },
+-    {"RGenReflRefr",            "RtRaygenReflRefr.rgen.spv"            },
+-    {"RGenDirect",              "RtRaygenDirect.rgen.spv"              },
+-    {"RGenIndirectInit",        "RtRaygenIndirectInit.rgen.spv"        },
+-    {"RGenIndirectFinal",       "RtRaygenIndirectFinal.rgen.spv"       },
+-    {"RGenGradients",           "RtGradients.rgen.spv"                 },
+-    {"RInitialReservoirs",      "RtInitialReservoirs.rgen.spv"         },
+-    {"RVolumetric",             "RtVolumetric.rgen.spv"                },
+-    {"RMiss",                   "RtMiss.rmiss.spv"                     },
+-    {"RMissShadow",             "RtMissShadowCheck.rmiss.spv"          },
+-    {"RClsOpaque",              "RtClsOpaque.rchit.spv"                },
+-    {"RAlphaTest",              "RtAlphaTest.rahit.spv"                },
++    {"RGenPrimary",             "RtRaygenPrimary.comp.spv"             },
++    {"RGenReflRefr",            "RtRaygenReflRefr.comp.spv"            },
++    {"RGenDirect",              "RtRaygenDirect.comp.spv"              },
++    {"RGenIndirectInit",        "RtRaygenIndirectInit.comp.spv"        },
++    {"RGenIndirectFinal",       "RtRaygenIndirectFinal.comp.spv"       },
++    {"RGenGradients",           "RtGradients.comp.spv"                 },
++    {"RInitialReservoirs",      "RtInitialReservoirs.comp.spv"         },
++    {"RVolumetric",             "RtVolumetric.comp.spv"                },
+     {"CLightGridBuild",         "CmLightGridBuild.comp.spv"            },
+     {"CPrepareFinal",           "CmPrepareFinal.comp.spv"              },
+     {"CLuminanceHistogram",     "CmLuminanceHistogram.comp.spv"        },
+@@ -245,7 +241,7 @@ VkShaderStageFlagBits ShaderManager::GetStageByExtension(const char *name)
+     {
+         return VK_SHADER_STAGE_COMPUTE_BIT;
+     }
+-    else if (std::strstr(name, ".rgen.spv") != nullptr)
++    else if (std::strstr(name, ".comp.spv") != nullptr)
+     {
+         return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+     }
+diff --git a/Source/Shaders/RaygenCommon.h b/Source/Shaders/RaygenCommon.h
+index 08448e7..c627845 100644
+--- a/Source/Shaders/RaygenCommon.h
++++ b/Source/Shaders/RaygenCommon.h
+@@ -21,7 +21,66 @@
+ #ifndef RAYGEN_COMMON_H_
+ #define RAYGEN_COMMON_H_
+ 
+-#extension GL_EXT_ray_tracing : require
++// Ray query version: these shaders run as compute shaders and trace rays
++// inline with rayQueryEXT, so only VK_KHR_ray_query is needed (no ray tracing pipeline).
++#extension GL_EXT_ray_query : require
++
++
++
++// Descriptor sets of the ray query passes (see RayTracingPipeline.cpp). Mobile GPUs can
++// bind few sets at once (Adreno: 8, Turnip: 7), so the small sets (TLAS, global uniform,
++// blue noise, cubemaps, render cubemap, portals) are copied into one combined set,
++// and the rest are renumbered. Bindings in the combined set: ShaderCommonGLSLFunc.h.
++#define DESC_SET_RAY_QUERY_COMBINED 1
++
++#ifdef DESC_SET_FRAMEBUFFERS
++    #undef  DESC_SET_FRAMEBUFFERS
++    #define DESC_SET_FRAMEBUFFERS       DESC_SET_RQ_FRAMEBUFFERS
++#endif
++#ifdef DESC_SET_VERTEX_DATA
++    #undef  DESC_SET_VERTEX_DATA
++    #define DESC_SET_VERTEX_DATA        DESC_SET_RQ_VERTEX_DATA
++#endif
++#ifdef DESC_SET_TEXTURES
++    #undef  DESC_SET_TEXTURES
++    #define DESC_SET_TEXTURES           DESC_SET_RQ_TEXTURES
++#endif
++#ifdef DESC_SET_LIGHT_SOURCES
++    #undef  DESC_SET_LIGHT_SOURCES
++    #define DESC_SET_LIGHT_SOURCES      DESC_SET_RQ_LIGHT_SOURCES
++#endif
++#ifdef DESC_SET_RESTIR_INDIRECT
++    #undef  DESC_SET_RESTIR_INDIRECT
++    #define DESC_SET_RESTIR_INDIRECT    DESC_SET_RQ_RESTIR_INDIRECT
++#endif
++#ifdef DESC_SET_VOLUMETRIC
++    #undef  DESC_SET_VOLUMETRIC
++    #define DESC_SET_VOLUMETRIC         DESC_SET_RQ_VOLUMETRIC
++#endif
++#ifdef DESC_SET_TLAS
++    #undef  DESC_SET_TLAS
++    #define DESC_SET_TLAS               DESC_SET_RQ_COMBINED
++#endif
++#ifdef DESC_SET_GLOBAL_UNIFORM
++    #undef  DESC_SET_GLOBAL_UNIFORM
++    #define DESC_SET_GLOBAL_UNIFORM     DESC_SET_RQ_COMBINED
++#endif
++#ifdef DESC_SET_RANDOM
++    #undef  DESC_SET_RANDOM
++    #define DESC_SET_RANDOM             DESC_SET_RQ_COMBINED
++#endif
++#ifdef DESC_SET_CUBEMAPS
++    #undef  DESC_SET_CUBEMAPS
++    #define DESC_SET_CUBEMAPS           DESC_SET_RQ_COMBINED
++#endif
++#ifdef DESC_SET_RENDER_CUBEMAP
++    #undef  DESC_SET_RENDER_CUBEMAP
++    #define DESC_SET_RENDER_CUBEMAP     DESC_SET_RQ_COMBINED
++#endif
++#ifdef DESC_SET_PORTALS
++    #undef  DESC_SET_PORTALS
++    #define DESC_SET_PORTALS            DESC_SET_RQ_COMBINED
++#endif
+ 
+ 
+ 
+@@ -29,6 +88,29 @@
+ 
+ 
+ 
++layout(local_size_x = COMPUTE_RAY_QUERY_GROUP_SIZE_X, local_size_y = COMPUTE_RAY_QUERY_GROUP_SIZE_Y, local_size_z = 1) in;
++
++// Replaces gl_LaunchSizeEXT: the dispatch is rounded up to whole workgroups,
++// so the real launch size comes from a push constant.
++layout(push_constant) uniform RayQueryPush_BT
++{
++    uint launchWidth;
++    uint launchHeight;
++    uint launchDepth;
++} rayQueryPush;
++
++#define RAY_LAUNCH_ID (gl_GlobalInvocationID)
++
++// Must be checked at the start of main(): invocations past the launch size do nothing
++bool isOutsideRayLaunch()
++{
++    return gl_GlobalInvocationID.x >= rayQueryPush.launchWidth ||
++           gl_GlobalInvocationID.y >= rayQueryPush.launchHeight ||
++           gl_GlobalInvocationID.z >= rayQueryPush.launchDepth;
++}
++
++
++
+ #if !defined(DESC_SET_TLAS) || \
+     !defined(DESC_SET_GLOBAL_UNIFORM) || \
+     !defined(DESC_SET_VERTEX_DATA) || \
+@@ -91,11 +173,82 @@ layout(set = DESC_SET_PORTALS, binding = BINDING_PORTAL_INSTANCES) uniform reado
+ #endif
+ 
+ 
+-layout(location = PAYLOAD_INDEX_DEFAULT) rayPayloadEXT ShPayload g_payload;
++// Inline replacement for the any-hit shader (RtAlphaTest.rahit).
++// Only alpha-tested instances produce candidates: fully opaque instances are built with
++// VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR and are committed automatically,
++// alpha-tested ones with VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR.
++#define RAY_QUERY_ALPHA_THRESHOLD 0.5
+ 
+-#if LIGHT_SAMPLE_METHOD != LIGHT_SAMPLE_METHOD_NONE
+-layout(location = PAYLOAD_INDEX_SHADOW) rayPayloadEXT ShPayloadShadow g_payloadShadow;
+-#endif
++bool isCandidateAlphaTestPassed(int instanceId, int instanceCustomIndex, int geometryIndex, int primitiveId, vec2 inBaryCoords)
++{
++    const ShTriangle tr = getTriangle(instanceId, instanceCustomIndex, geometryIndex, primitiveId);
++
++    const vec3 baryCoords = vec3(1.0f - inBaryCoords.x - inBaryCoords.y, inBaryCoords.x, inBaryCoords.y);
++    const vec2 texCoord = tr.layerTexCoord[0] * baryCoords;
++
++    // check only first material's albedo;
++    // explicit LOD 0, as compute shaders have no implicit derivatives
++    // (the any-hit shader also effectively sampled the base level)
++    const vec4 color =
++        getTextureSampleLod(tr.materials[0][MATERIAL_ALBEDO_ALPHA_INDEX], texCoord, 0.0) *
++        tr.materialColors[0];
++
++    // same condition as in RtAlphaTest.rahit: if true, the intersection is ignored
++    return !((color.r + color.g + color.b) / 3 * color.a + color.a < RAY_QUERY_ALPHA_THRESHOLD);
++}
++
++// Run traversal to the end, alpha-testing every candidate triangle.
++// A macro, as glslang doesn't allow passing rayQueryEXT as an inout parameter.
++#define PROCEED_RAY_QUERY_WITH_ALPHA_TEST(rq) \
++    while (rayQueryProceedEXT(rq)) \
++    { \
++        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) \
++        { \
++            if (isCandidateAlphaTestPassed( \
++                    rayQueryGetIntersectionInstanceIdEXT(rq, false), \
++                    rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), \
++                    rayQueryGetIntersectionGeometryIndexEXT(rq, false), \
++                    rayQueryGetIntersectionPrimitiveIndexEXT(rq, false), \
++                    rayQueryGetIntersectionBarycentricsEXT(rq, false))) \
++            { \
++                rayQueryConfirmIntersectionEXT(rq); \
++            } \
++        } \
++    }
++
++ShPayload newEmptyPayload()
++{
++    ShPayload p;
++    p.baryCoords = vec2(0.0);
++    p.instIdAndIndex = UINT32_MAX;
++    p.geomAndPrimIndex = UINT32_MAX;
++    return p;
++}
++
++// Inline replacement for the closest-hit (RtClsOpaque.rchit) and miss (RtMiss.rmiss) shaders
++ShPayload traceRayQueryClosest(uint rayFlags, uint cullMask, vec3 origin, float tMin, vec3 direction, float tMax)
++{
++    rayQueryEXT rq;
++    rayQueryInitializeEXT(rq, topLevelAS, rayFlags, cullMask, origin, tMin, direction, tMax);
++
++    PROCEED_RAY_QUERY_WITH_ALPHA_TEST(rq);
++
++    // miss: empty payload
++    ShPayload p = newEmptyPayload();
++
++    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT)
++    {
++        p.baryCoords = rayQueryGetIntersectionBarycentricsEXT(rq, true);
++        p.instIdAndIndex = packInstanceIdAndCustomIndex(
++            rayQueryGetIntersectionInstanceIdEXT(rq, true),
++            rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
++        p.geomAndPrimIndex = packGeometryAndPrimitiveIndex(
++            rayQueryGetIntersectionGeometryIndexEXT(rq, true),
++            rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
++    }
++
++    return p;
++}
+ 
+ 
+ 
+@@ -202,65 +355,34 @@ bool doesPayloadContainHitInfo(const ShPayload p)
+     return true;
+ }
+ 
+-void resetPayload()
+-{
+-    g_payload.baryCoords = vec2(0.0);
+-    g_payload.instIdAndIndex = UINT32_MAX;
+-    g_payload.geomAndPrimIndex = UINT32_MAX;
+-}
+-
+ ShPayload tracePrimaryRay(vec3 origin, vec3 direction)
+ {
+-    resetPayload();
+-
+     uint cullMask = getPrimaryVisibilityCullMask();
+ 
+-    traceRayEXT(
+-        topLevelAS,
+-        getAdditionalRayFlags(), 
+-        cullMask, 
+-        0, 0,     // sbtRecordOffset, sbtRecordStride
+-        SBT_INDEX_MISS_DEFAULT, 
+-        origin, globalUniform.primaryRayMinDist, direction, globalUniform.rayLength, 
+-        PAYLOAD_INDEX_DEFAULT);
+-
+-    return g_payload; 
++    return traceRayQueryClosest(
++        getAdditionalRayFlags(),
++        cullMask,
++        origin, globalUniform.primaryRayMinDist, direction, globalUniform.rayLength);
+ }
+ 
+ ShPayload traceReflectionRefractionRay(vec3 origin, vec3 direction, uint surfInstCustomIndex, uint geometryInstanceFlags, bool isRefraction)
+ {
+-    resetPayload();
+-
+     uint cullMask = getReflectionRefractionCullMask(surfInstCustomIndex, geometryInstanceFlags, isRefraction);
+ 
+-    traceRayEXT(
+-        topLevelAS,
+-        getAdditionalRayFlags(), 
+-        cullMask, 
+-        0, 0,     // sbtRecordOffset, sbtRecordStride
+-        SBT_INDEX_MISS_DEFAULT, 
+-        origin, 0.001, direction, globalUniform.rayLength, 
+-        PAYLOAD_INDEX_DEFAULT);
+-
+-    return g_payload; 
++    return traceRayQueryClosest(
++        getAdditionalRayFlags(),
++        cullMask,
++        origin, 0.001, direction, globalUniform.rayLength);
+ }
+ 
+ ShPayload traceIndirectRay(uint surfInstCustomIndex, vec3 surfPosition, vec3 bounceDirection)
+ {
+-    resetPayload();
+-
+     uint cullMask = getIndirectIlluminationCullMask(surfInstCustomIndex);
+ 
+-    traceRayEXT(
+-        topLevelAS,
+-        getAdditionalRayFlags(), 
+-        cullMask, 
+-        0, 0,     // sbtRecordOffset, sbtRecordStride
+-        SBT_INDEX_MISS_DEFAULT, 
+-        surfPosition, 0.001, bounceDirection, globalUniform.rayLength, 
+-        PAYLOAD_INDEX_DEFAULT); 
+-
+-    return g_payload;
++    return traceRayQueryClosest(
++        getAdditionalRayFlags(),
++        cullMask,
++        surfPosition, 0.001, bounceDirection, globalUniform.rayLength);
+ }
+ 
+ 
+@@ -306,9 +428,6 @@ vec3 getSky(vec3 direction)
+ 
+ bool traceShadowRay(uint surfInstCustomIndex, vec3 start, vec3 end, bool ignoreFirstPersonViewer /* = false */)
+ {
+-    // prepare shadow payload
+-    g_payloadShadow.isShadowed = 1;  
+-
+     uint cullMask = getShadowCullMask(surfInstCustomIndex);
+ 
+     if (ignoreFirstPersonViewer)
+@@ -320,16 +439,17 @@ bool traceShadowRay(uint surfInstCustomIndex, vec3 start, vec3 end, bool ignoreF
+     float maxDistance = length(l);
+     l /= maxDistance;
+ 
+-    traceRayEXT(
+-        topLevelAS, 
+-        gl_RayFlagsSkipClosestHitShaderEXT | getAdditionalRayFlags(), 
+-        cullMask, 
+-        0, 0, 	// sbtRecordOffset, sbtRecordStride
+-        SBT_INDEX_MISS_SHADOW, 		// shadow missIndex
+-        start, 0.001, l, maxDistance - SHADOW_RAY_EPS, 
+-        PAYLOAD_INDEX_SHADOW);
++    // the original skipped the closest-hit shader and only asked if anything was hit:
++    // any confirmed intersection (after the alpha test) means shadowed
++    rayQueryEXT rq;
++    rayQueryInitializeEXT(rq, topLevelAS,
++        gl_RayFlagsTerminateOnFirstHitEXT | getAdditionalRayFlags(),
++        cullMask,
++        start, 0.001, l, maxDistance - SHADOW_RAY_EPS);
++
++    PROCEED_RAY_QUERY_WITH_ALPHA_TEST(rq);
+ 
+-    return g_payloadShadow.isShadowed == 1;
++    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+ }
+ 
+ float traceVisibility(const Surface surf, const vec3 lightPosition, uint lightIndex)
+diff --git a/Source/Shaders/RaygenPrimary.inl b/Source/Shaders/RaygenPrimary.inl
+index fdef8c5..7b7626f 100644
+--- a/Source/Shaders/RaygenPrimary.inl
++++ b/Source/Shaders/RaygenPrimary.inl
+@@ -260,9 +260,14 @@ vec3 getNormal(const vec3 position, const vec3 normalFromMap, const vec3 normalG
+ }
+ 
+ #ifdef RAYGEN_PRIMARY_SHADER
+-void main() 
++void main()
+ {
+-    const ivec2 regularPix = ivec2(gl_LaunchIDEXT.xy);
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 regularPix = ivec2(RAY_LAUNCH_ID.xy);
+     const ivec2 pix = getCheckerboardPix(regularPix);
+     const vec2 inUV = getPixelUVWithJitter(regularPix);
+ 
+@@ -333,15 +338,20 @@ void main()
+ 
+ 
+ #ifdef RAYGEN_REFL_REFR_SHADER
+-void main() 
++void main()
+ {
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
+     if (globalUniform.reflectRefractMaxDepth == 0)
+     {
+         return;
+     }
+ 
+ 
+-    const ivec2 regularPix = ivec2(gl_LaunchIDEXT.xy);
++    const ivec2 regularPix = ivec2(RAY_LAUNCH_ID.xy);
+     const ivec2 pix = getCheckerboardPix(regularPix);
+     const vec2 inUV = getPixelUVWithJitter(regularPix);
+ 
+diff --git a/Source/Shaders/RtAlphaTest.rahit b/Source/Shaders/RtAlphaTest.rahit
+deleted file mode 100644
+index a2cd9b0..0000000
+--- a/Source/Shaders/RtAlphaTest.rahit
++++ /dev/null
+@@ -1,57 +0,0 @@
+-// Copyright (c) 2021 Sultim Tsyrendashiev
+-// 
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-// 
+-// The above copyright notice and this permission notice shall be included in all
+-// copies or substantial portions of the Software.
+-// 
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-// SOFTWARE.
+-
+-#version 460
+-#extension GL_EXT_ray_tracing : require
+-
+-// don't need "processAlbedo" function
+-#define MATERIAL_MAX_ALBEDO_LAYERS 0
+-
+-#define DESC_SET_GLOBAL_UNIFORM 2
+-#define DESC_SET_VERTEX_DATA 3
+-#define DESC_SET_TEXTURES 4
+-#include "ShaderCommonGLSLFunc.h"
+-
+-hitAttributeEXT vec2 inBaryCoords;
+-
+-
+-#define ALPHA_THRESHOLD 0.5
+-
+-
+-void main()
+-{
+-	const ShTriangle tr = getTriangle(gl_InstanceID, gl_InstanceCustomIndexEXT, gl_GeometryIndexEXT, gl_PrimitiveID);
+-
+-	const vec3 baryCoords = vec3(1.0f - inBaryCoords.x - inBaryCoords.y, inBaryCoords.x, inBaryCoords.y);
+-    const vec2 texCoord = tr.layerTexCoord[0] * baryCoords;
+- 
+-	// check only first material's albedo
+- 	const vec4 color = getTextureSample(tr.materials[0][MATERIAL_ALBEDO_ALPHA_INDEX], texCoord) * tr.materialColors[0];
+-
+-	// if must be discarded
+-	if ((color.r + color.g + color.b) / 3 * color.a + color.a < ALPHA_THRESHOLD)
+-	{
+-		// then ignore this intersection, so it won't be the closest hit
+-		ignoreIntersectionEXT;
+-	}
+-
+-	// otherwise, do nothing, as this intersection 
+-	// can or can't be the closest hit
+-}
+diff --git a/Source/Shaders/RtClsOpaque.rchit b/Source/Shaders/RtClsOpaque.rchit
+deleted file mode 100644
+index 7e1366c..0000000
+--- a/Source/Shaders/RtClsOpaque.rchit
++++ /dev/null
+@@ -1,34 +0,0 @@
+-// Copyright (c) 2021 Sultim Tsyrendashiev
+-// 
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-// 
+-// The above copyright notice and this permission notice shall be included in all
+-// copies or substantial portions of the Software.
+-// 
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-// SOFTWARE.
+-
+-#version 460
+-#extension GL_EXT_ray_tracing : require
+-
+-#include "ShaderCommonGLSLFunc.h"
+-
+-layout(location = PAYLOAD_INDEX_DEFAULT) rayPayloadInEXT ShPayload g_payload;
+-hitAttributeEXT vec2 inBaryCoords;
+-
+-void main()
+-{
+-    g_payload.baryCoords = inBaryCoords;
+-    g_payload.instIdAndIndex = packInstanceIdAndCustomIndex(gl_InstanceID, gl_InstanceCustomIndexEXT);
+-    g_payload.geomAndPrimIndex = packGeometryAndPrimitiveIndex(gl_GeometryIndexEXT, gl_PrimitiveID);
+-}
+diff --git a/Source/Shaders/RtGradients.rgen b/Source/Shaders/RtGradients.comp
+similarity index 97%
+rename from Source/Shaders/RtGradients.rgen
+rename to Source/Shaders/RtGradients.comp
+index a6af699..b685527 100644
+--- a/Source/Shaders/RtGradients.rgen
++++ b/Source/Shaders/RtGradients.comp
+@@ -42,7 +42,12 @@
+ 
+ void main()
+ {
+-    const ivec2 gradPix = ivec2(gl_LaunchIDEXT.xy);
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 gradPix = ivec2(RAY_LAUNCH_ID.xy);
+     const ivec2 screenSize = ivec2(globalUniform.renderWidth, globalUniform.renderHeight);
+ 
+     if (gradPix.x * COMPUTE_ASVGF_STRATA_SIZE >= screenSize.x || gradPix.y * COMPUTE_ASVGF_STRATA_SIZE >= screenSize.y)
+diff --git a/Source/Shaders/RtInitialReservoirs.rgen b/Source/Shaders/RtInitialReservoirs.comp
+similarity index 94%
+rename from Source/Shaders/RtInitialReservoirs.rgen
+rename to Source/Shaders/RtInitialReservoirs.comp
+index f289fd4..df9a857 100644
+--- a/Source/Shaders/RtInitialReservoirs.rgen
++++ b/Source/Shaders/RtInitialReservoirs.comp
+@@ -35,7 +35,12 @@
+ 
+ void main()
+ {
+-    const ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 pix = ivec2(RAY_LAUNCH_ID.xy);
+     const uint seed = getRandomSeed(pix, globalUniform.frameId);
+     const Surface surf = fetchGbufferSurface(pix);
+ 
+diff --git a/Source/Shaders/RtMiss.rmiss b/Source/Shaders/RtMiss.rmiss
+deleted file mode 100644
+index 1800f9a..0000000
+--- a/Source/Shaders/RtMiss.rmiss
++++ /dev/null
+@@ -1,29 +0,0 @@
+-// Copyright (c) 2021 Sultim Tsyrendashiev
+-// 
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-// 
+-// The above copyright notice and this permission notice shall be included in all
+-// copies or substantial portions of the Software.
+-// 
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-// SOFTWARE.
+-
+-#version 460
+-#extension GL_EXT_ray_tracing : require
+-
+-#include "ShaderCommonGLSLFunc.h"
+-
+-layout(location = PAYLOAD_INDEX_DEFAULT) rayPayloadInEXT ShPayload g_payload;
+-
+-void main()
+-{}
+\ No newline at end of file
+diff --git a/Source/Shaders/RtMissShadowCheck.rmiss b/Source/Shaders/RtMissShadowCheck.rmiss
+deleted file mode 100644
+index 04d324c..0000000
+--- a/Source/Shaders/RtMissShadowCheck.rmiss
++++ /dev/null
+@@ -1,31 +0,0 @@
+-// Copyright (c) 2021 Sultim Tsyrendashiev
+-// 
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-// 
+-// The above copyright notice and this permission notice shall be included in all
+-// copies or substantial portions of the Software.
+-// 
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-// SOFTWARE.
+-
+-#version 460
+-#extension GL_EXT_ray_tracing : require
+-
+-#include "ShaderCommonGLSLFunc.h"
+-
+-layout(location = PAYLOAD_INDEX_SHADOW) rayPayloadInEXT ShPayloadShadow payloadShadow;
+-
+-void main()
+-{
+-    payloadShadow.isShadowed = 0;
+-}
+\ No newline at end of file
+diff --git a/Source/Shaders/RtRaygenDirect.rgen b/Source/Shaders/RtRaygenDirect.comp
+similarity index 95%
+rename from Source/Shaders/RtRaygenDirect.rgen
+rename to Source/Shaders/RtRaygenDirect.comp
+index ec05f36..a3bb678 100644
+--- a/Source/Shaders/RtRaygenDirect.rgen
++++ b/Source/Shaders/RtRaygenDirect.comp
+@@ -35,7 +35,12 @@
+ 
+ void main()
+ {
+-    const ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 pix = ivec2(RAY_LAUNCH_ID.xy);
+     const uint seed = getRandomSeed(pix, globalUniform.frameId);
+ 
+     const Surface surf = fetchGbufferSurface(pix);
+diff --git a/Source/Shaders/RtRaygenIndirect.inl b/Source/Shaders/RtRaygenIndirect.inl
+index d025c7c..862f73d 100644
+--- a/Source/Shaders/RtRaygenIndirect.inl
++++ b/Source/Shaders/RtRaygenIndirect.inl
+@@ -216,7 +216,12 @@ float getDiffuseWeight( float roughness )
+ #ifdef RT_RAYGEN_INDIRECT_INIT
+ void main()
+ {
+-    const ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 pix = ivec2(RAY_LAUNCH_ID.xy);
+     const uint seed = getRandomSeed(pix, globalUniform.frameId);
+     uint salt = RANDOM_SALT_RESAMPLE_INDIRECT_BASE;
+ 
+@@ -252,7 +257,12 @@ ReservoirIndirect loadInitialSampleAsReservoir( const ivec2 pix )
+ 
+ void main()
+ {
+-    const ivec2 pix  = ivec2( gl_LaunchIDEXT.xy );
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec2 pix  = ivec2( RAY_LAUNCH_ID.xy );
+     const uint  seed = getRandomSeed( pix, globalUniform.frameId );
+     uint        salt = RANDOM_SALT_RESAMPLE_INDIRECT_BASE;
+ 
+diff --git a/Source/Shaders/RtRaygenIndirectFinal.rgen b/Source/Shaders/RtRaygenIndirectFinal.comp
+similarity index 100%
+rename from Source/Shaders/RtRaygenIndirectFinal.rgen
+rename to Source/Shaders/RtRaygenIndirectFinal.comp
+diff --git a/Source/Shaders/RtRaygenIndirectInit.rgen b/Source/Shaders/RtRaygenIndirectInit.comp
+similarity index 100%
+rename from Source/Shaders/RtRaygenIndirectInit.rgen
+rename to Source/Shaders/RtRaygenIndirectInit.comp
+diff --git a/Source/Shaders/RtRaygenPrimary.rgen b/Source/Shaders/RtRaygenPrimary.comp
+similarity index 100%
+rename from Source/Shaders/RtRaygenPrimary.rgen
+rename to Source/Shaders/RtRaygenPrimary.comp
+diff --git a/Source/Shaders/RtRaygenReflRefr.rgen b/Source/Shaders/RtRaygenReflRefr.comp
+similarity index 100%
+rename from Source/Shaders/RtRaygenReflRefr.rgen
+rename to Source/Shaders/RtRaygenReflRefr.comp
+diff --git a/Source/Shaders/RtVolumetric.rgen b/Source/Shaders/RtVolumetric.comp
+similarity index 98%
+rename from Source/Shaders/RtVolumetric.rgen
+rename to Source/Shaders/RtVolumetric.comp
+index 90f1081..0ebca33 100644
+--- a/Source/Shaders/RtVolumetric.rgen
++++ b/Source/Shaders/RtVolumetric.comp
+@@ -47,7 +47,12 @@ float phaseFunction_Schlick( const vec3 tolight, const vec3 toviewer, float assy
+ 
+ void main()
+ {
+-    const ivec3 cell = ivec3( gl_LaunchIDEXT.xyz );
++    if (isOutsideRayLaunch())
++    {
++        return;
++    }
++
++    const ivec3 cell = ivec3( RAY_LAUNCH_ID.xyz );
+ 
+     if( globalUniform.volumeEnableType != VOLUME_ENABLE_VOLUMETRIC )
+     {
+diff --git a/Source/Shaders/ShaderCommonGLSLFunc.h b/Source/Shaders/ShaderCommonGLSLFunc.h
+index 1a05cd5..a6bed84 100644
+--- a/Source/Shaders/ShaderCommonGLSLFunc.h
++++ b/Source/Shaders/ShaderCommonGLSLFunc.h
+@@ -23,6 +23,25 @@
+ 
+ #include "Utils.h"
+ #include "ShaderCommonGLSL.h"
++
++#ifdef DESC_SET_RAY_QUERY_COMBINED
++    // Ray query path tracing passes: the TLAS, global uniform, blue noise, cubemaps,
++    // render cubemap and portals are copied into one descriptor set (DESC_SET_RQ_COMBINED),
++    // as mobile GPUs can bind few sets at once. Remap their bindings to that set's layout,
++    // which is created in RayTracingPipeline.cpp.
++    #undef  BINDING_ACCELERATION_STRUCTURE_MAIN
++    #define BINDING_ACCELERATION_STRUCTURE_MAIN BINDING_RQ_ACCELERATION_STRUCTURE_MAIN
++    #undef  BINDING_GLOBAL_UNIFORM
++    #define BINDING_GLOBAL_UNIFORM              BINDING_RQ_GLOBAL_UNIFORM
++    #undef  BINDING_BLUE_NOISE
++    #define BINDING_BLUE_NOISE                  BINDING_RQ_BLUE_NOISE
++    #undef  BINDING_CUBEMAPS
++    #define BINDING_CUBEMAPS                    BINDING_RQ_CUBEMAPS
++    #undef  BINDING_RENDER_CUBEMAP
++    #define BINDING_RENDER_CUBEMAP              BINDING_RQ_RENDER_CUBEMAP
++    #undef  BINDING_PORTAL_INSTANCES
++    #define BINDING_PORTAL_INSTANCES            BINDING_RQ_PORTAL_INSTANCES
++#endif // DESC_SET_RAY_QUERY_COMBINED
+ #include "Structs.h"
+ 
+ // Functions to access RTGL data.
+diff --git a/Source/TextureManager.cpp b/Source/TextureManager.cpp
+index f92ff66..0708b35 100644
+--- a/Source/TextureManager.cpp
++++ b/Source/TextureManager.cpp
+@@ -791,3 +791,8 @@ uint32_t TextureManager::GetWaterNormalTextureIndex() const
+ {
+     return waterNormalTextureIndex;
+ }
++
++uint32_t RTGL1::TextureManager::GetMaxTextureCount() const
++{
++    return static_cast< uint32_t >( textures.size() );
++}
+diff --git a/Source/TextureManager.h b/Source/TextureManager.h
+index ba77966..a092f67 100644
+--- a/Source/TextureManager.h
++++ b/Source/TextureManager.h
+@@ -77,6 +77,7 @@ public:
+ 
+     VkDescriptorSet GetDescSet(uint32_t frameIndex) const;
+     VkDescriptorSetLayout GetDescSetLayout() const;
++    uint32_t GetMaxTextureCount() const;
+ 
+     // Subscribe to material change event.
+     // shared_ptr will be transformed to weak_ptr
+diff --git a/Source/TextureUploader.cpp b/Source/TextureUploader.cpp
+index dbb821b..660da23 100644
+--- a/Source/TextureUploader.cpp
++++ b/Source/TextureUploader.cpp
+@@ -274,7 +274,7 @@ void TextureUploader::PrepareImage(VkImage image, VkBuffer staging[], const Uplo
+     {
+         curAccessMask = VK_ACCESS_SHADER_READ_BIT;
+         curLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+-        curStageMask = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++        curStageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+     }
+     else
+     {
+@@ -365,7 +365,7 @@ void TextureUploader::PrepareImage(VkImage image, VkBuffer staging[], const Uplo
+             cmd, image,
+             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+             curLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+             allMipmaps);
+     }
+     else
+@@ -376,7 +376,7 @@ void TextureUploader::PrepareImage(VkImage image, VkBuffer staging[], const Uplo
+             cmd, image,
+             curAccessMask, VK_ACCESS_SHADER_READ_BIT,
+             curLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+-            curStageMask, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++            curStageMask, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+             firstMipmap);
+     }
+ }
+diff --git a/Source/Utils.cpp b/Source/Utils.cpp
+index ba767d8..d448560 100644
+--- a/Source/Utils.cpp
++++ b/Source/Utils.cpp
+@@ -104,7 +104,7 @@ void Utils::ASBuildMemoryBarrier(VkCommandBuffer cmd)
+     vkCmdPipelineBarrier(
+         cmd,
+         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         0,
+         1, &barrier,
+         0, nullptr,
+diff --git a/Source/VertexCollector.cpp b/Source/VertexCollector.cpp
+index 5fee434..463f8af 100644
+--- a/Source/VertexCollector.cpp
++++ b/Source/VertexCollector.cpp
+@@ -633,7 +633,7 @@ bool RTGL1::VertexCollector::RecopyTexCoordsFromStaging( VkCommandBuffer cmd )
+ 
+     vkCmdPipelineBarrier( cmd,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                          VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0,
+                           0,
+                           nullptr,
+@@ -916,7 +916,7 @@ void VertexCollector::InsertVertexPreprocessFinishBarrier( VkCommandBuffer cmd )
+     vkCmdPipelineBarrier( cmd,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+-                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
++                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           0,
+                           0,
+                           nullptr,
+diff --git a/Source/Volumetric.cpp b/Source/Volumetric.cpp
+index 346348a..a9008d7 100644
+--- a/Source/Volumetric.cpp
++++ b/Source/Volumetric.cpp
+@@ -79,7 +79,7 @@ void RTGL1::Volumetric::ProcessScattering( VkCommandBuffer      cmd,
+             .sType        = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+             .pNext        = nullptr,
+             .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+-                            VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
++                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT,
+             .dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+             .dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT,
+@@ -328,31 +328,31 @@ void RTGL1::Volumetric::CreateDescriptors()
+             .binding         = BINDING_VOLUMETRIC_STORAGE,
+             .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+             .descriptorCount = 1,
+-            .stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT,
++            .stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT,
+         },
+         {
+             .binding         = BINDING_VOLUMETRIC_SAMPLER,
+             .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             .descriptorCount = 1,
+-            .stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++            .stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+         },
+         {
+             .binding         = BINDING_VOLUMETRIC_SAMPLER_PREV,
+             .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             .descriptorCount = 1,
+-            .stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++            .stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+         },
+         {
+             .binding         = BINDING_VOLUMETRIC_ILLUMINATION,
+             .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+             .descriptorCount = 1,
+-            .stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT,
++            .stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT,
+         },
+         {
+             .binding         = BINDING_VOLUMETRIC_ILLUMINATION_SAMPLER,
+             .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             .descriptorCount = 1,
+-            .stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++            .stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+         },
+     };
+ 
+diff --git a/Source/VulkanDevice_Init.cpp b/Source/VulkanDevice_Init.cpp
+index ba046b9..0c05820 100644
+--- a/Source/VulkanDevice_Init.cpp
++++ b/Source/VulkanDevice_Init.cpp
+@@ -1,3 +1,5 @@
++#include <utility>
++#include <string>
+ #include <cstddef>
+ // Copyright (c) 2020-2021 Sultim Tsyrendashiev
+ // 
+@@ -588,14 +590,15 @@ void VulkanDevice::CreateDevice()
+     sync2Features.pNext = &storage16;
+     sync2Features.synchronization2 = 1;
+ 
+-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures = {};
+-    rtPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+-    rtPipelineFeatures.pNext = &sync2Features;
+-    rtPipelineFeatures.rayTracingPipeline = 1;
++    // ray query version: rays are traced inline from compute shaders
++    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures = {};
++    rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
++    rayQueryFeatures.pNext = &sync2Features;
++    rayQueryFeatures.rayQuery = 1;
+ 
+     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures = {};
+     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+-    asFeatures.pNext = &rtPipelineFeatures;
++    asFeatures.pNext = &rayQueryFeatures;
+     asFeatures.accelerationStructure = 1;
+ 
+     VkPhysicalDeviceFeatures2 physicalDeviceFeatures2 = {};
+@@ -610,14 +613,18 @@ void VulkanDevice::CreateDevice()
+         VkPhysicalDeviceMultiviewFeatures                   sMv     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES };
+         VkPhysicalDevice16BitStorageFeatures                s16     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES };
+         VkPhysicalDeviceSynchronization2FeaturesKHR         sSync2  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR };
+-        VkPhysicalDeviceRayTracingPipelineFeaturesKHR       sRt     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
++        VkPhysicalDeviceRayQueryFeaturesKHR                 sRq     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+         VkPhysicalDeviceAccelerationStructureFeaturesKHR    sAs     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+ 
+         s12.pNext = &sMv;
+         sMv.pNext = &s16;
+         s16.pNext = &sAs;
+-        sAs.pNext = &sRt;
+-        sRt.pNext = &sSync2;
++        sAs.pNext = &sRq;
++        // sync2 struct is only valid to query if the extension (or Vulkan 1.3) is there
++        if (PhysicalDevice::IsExtensionSupported(physDevice->Get(), VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME))
++        {
++            sRq.pNext = &sSync2;
++        }
+ 
+         VkPhysicalDeviceFeatures2 supported = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+         supported.pNext = &s12;
+@@ -643,10 +650,36 @@ void VulkanDevice::CreateDevice()
+         RG_MASK_FEATURES(multiviewFeatures,  sMv,    VkPhysicalDeviceMultiviewFeatures,                  multiview,                  multiviewTessellationShader);
+         RG_MASK_FEATURES(storage16,          s16,    VkPhysicalDevice16BitStorageFeatures,               storageBuffer16BitAccess,   storageInputOutput16);
+         RG_MASK_FEATURES(sync2Features,      sSync2, VkPhysicalDeviceSynchronization2FeaturesKHR,        synchronization2,           synchronization2);
+-        RG_MASK_FEATURES(rtPipelineFeatures, sRt,    VkPhysicalDeviceRayTracingPipelineFeaturesKHR,      rayTracingPipeline,         rayTraversalPrimitiveCulling);
++        RG_MASK_FEATURES(rayQueryFeatures,   sRq,    VkPhysicalDeviceRayQueryFeaturesKHR,                rayQuery,                   rayQuery);
+         RG_MASK_FEATURES(asFeatures,         sAs,    VkPhysicalDeviceAccelerationStructureFeaturesKHR,   accelerationStructure,      descriptorBindingAccelerationStructureUpdateAfterBind);
+ 
+         #undef RG_MASK_FEATURES
++
++        // required by the shaders (SPIR-V capabilities) or by the host code
++        const std::pair< VkBool32, const char* > required[] = {
++            { physicalDeviceFeatures2.features.shaderInt16, "shaderInt16" },
++            { physicalDeviceFeatures2.features.shaderStorageImageExtendedFormats, "shaderStorageImageExtendedFormats" },
++            { physicalDeviceFeatures2.features.samplerAnisotropy, "samplerAnisotropy" },
++            { vulkan12Features.runtimeDescriptorArray, "runtimeDescriptorArray" },
++            { vulkan12Features.shaderSampledImageArrayNonUniformIndexing, "shaderSampledImageArrayNonUniformIndexing" },
++            { vulkan12Features.bufferDeviceAddress, "bufferDeviceAddress" },
++            { vulkan12Features.shaderFloat16, "shaderFloat16" },
++            { multiviewFeatures.multiview, "multiview" },
++            { storage16.storageBuffer16BitAccess, "storageBuffer16BitAccess" },
++            { sync2Features.synchronization2, "synchronization2" },
++            { rayQueryFeatures.rayQuery, "rayQuery" },
++            { asFeatures.accelerationStructure, "accelerationStructure" },
++        };
++
++        for( const auto& [ isSupported, name ] : required )
++        {
++            if( !isSupported )
++            {
++                using namespace std::string_literals;
++                throw RgException( RG_CANT_FIND_PHYSICAL_DEVICE,
++                                   "The GPU or its driver doesn't support the Vulkan feature "s + name );
++            }
++        }
+     }
+ 
+     std::vector<VkExtensionProperties> supportedDeviceExtensions;
+@@ -661,8 +694,7 @@ void VulkanDevice::CreateDevice()
+     std::vector<const char *> deviceExtensions = {
+         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+-        VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
+-        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
++        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+         VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+-- 
+2.43.0
+

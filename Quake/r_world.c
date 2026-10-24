@@ -726,6 +726,7 @@ static void RT_ClearBatch (cb_context_t *cbx)
 {
 	cbx->batch_verts_count = 0;
 	cbx->batch_indices_count = 0;
+	cbx->batch_first_surf = NULL;
 }
 
 RgTransform RT_GetBrushModelMatrix (entity_t *e)
@@ -837,6 +838,11 @@ static void RT_FlushBatch (cb_context_t *cbx, const rt_uploadsurf_state_t *s, ui
 
     const RgVertex *vertices = cbx->batch_verts;
 	const uint32_t *indices = cbx->batch_indices;
+	// The batch's ID comes from its first surface. (It used to be s->surf, the
+	// surface that triggered the flush: when a batch overflowed, the flushed
+	// batch got the next batch's surface ID, and two uploads could share an ID:
+	// "Geometry with ID=... already exists", e.g. on e1m2.)
+	const msurface_t *batch_surf = cbx->batch_first_surf ? cbx->batch_first_surf : s->surf;
 	const int       num_surf_verts = cbx->batch_verts_count;
 	const int       num_surf_indices = cbx->batch_indices_count;
 
@@ -879,7 +885,7 @@ static void RT_FlushBatch (cb_context_t *cbx, const rt_uploadsurf_state_t *s, ui
 			const vec_t *a2 = vertices[indices[tri * 3 + 2]].position;
 			
 			RgPolygonalLightUploadInfo light_info = {
-				.uniqueID = RT_GetBrushSurfUniqueId (s->entuniqueid, s->model, s->surf, tri),
+				.uniqueID = RT_GetBrushSurfUniqueId (s->entuniqueid, s->model, batch_surf, tri),
 				.color = RT_VEC3(color),
 				.positions =
 					{
@@ -981,7 +987,7 @@ static void RT_FlushBatch (cb_context_t *cbx, const rt_uploadsurf_state_t *s, ui
 	else
 	{
 		RgGeometryUploadInfo info = {
-			.uniqueID = RT_GetBrushSurfUniqueId (s->entuniqueid, s->model, s->surf, 0),
+			.uniqueID = RT_GetBrushSurfUniqueId (s->entuniqueid, s->model, batch_surf, 0),
 			.flags = 
 			    (is_mirror ? RG_GEOMETRY_UPLOAD_REFL_REFR_ALBEDO_MULTIPLY_BIT : 0) |
 			    (s->is_teleport ? RG_GEOMETRY_UPLOAD_REFL_REFR_ALBEDO_ADD_BIT : 0) |
@@ -1054,6 +1060,9 @@ static void RT_BatchSurface (cb_context_t *cbx, const rt_uploadsurf_state_t *s, 
 	{
 		RT_FlushBatch (cbx, s, brushpasses);
 	}
+
+	if (cbx->batch_verts_count == 0)
+		cbx->batch_first_surf = s->surf;
 
 	R_TriangleIndicesForSurf (cbx->batch_verts_count, num_surf_verts, &cbx->batch_indices[cbx->batch_indices_count]);
 	memcpy (&cbx->batch_verts[cbx->batch_verts_count], rtallbrushvertices + s->surf->vbo_firstvert, sizeof (RgVertex) * num_surf_verts);

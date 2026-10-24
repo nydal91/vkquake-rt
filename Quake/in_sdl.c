@@ -22,6 +22,12 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "quakedef.h"
+#include "android_sys.h"
+#include "android_touch.h"
+
+#ifdef __ANDROID__
+void VID_AndroidWindowChanged (void);
+#endif
 
 static qboolean textmode;
 
@@ -597,6 +603,9 @@ void IN_Move (usercmd_t *cmd)
 {
 	IN_JoyMove (cmd);
 	IN_MouseMove (cmd);
+#ifdef HAVE_TOUCH_CONTROLS
+	AndroidTouch_Move (cmd);
+#endif
 }
 
 void IN_ClearStates (void) {}
@@ -872,6 +881,43 @@ void IN_SendKeyEvents (void)
 
 	while (SDL_PollEvent (&event))
 	{
+#ifdef HAVE_TOUCH_CONTROLS
+		if (AndroidTouch_HandleEvent (&event))
+			continue;
+		if (event.type == SDL_CONTROLLERBUTTONDOWN ||
+		    (event.type == SDL_CONTROLLERAXISMOTION && (event.caxis.value > 16000 || event.caxis.value < -16000)))
+			AndroidTouch_ControllerUsed ();
+#endif
+#ifdef __ANDROID__
+		// Android destroys the window's surface in the background and makes a
+		// new one on return; SDL blocks this loop while paused. The renderer
+		// swaps the surface at the start of the next frame.
+		switch (event.type)
+		{
+		case SDL_APP_WILLENTERBACKGROUND:
+			Sys_Printf ("Android: entering background\n");
+			break;
+		case SDL_APP_DIDENTERBACKGROUND:
+			Sys_Printf ("Android: in background\n");
+			Android_SetRunning (0); // Android may kill a backgrounded app; that isn't a crash
+			break;
+		case SDL_APP_DIDENTERFOREGROUND:
+			Sys_Printf ("Android: in foreground, recreating the surface\n");
+			Android_SetRunning (1);
+			VID_AndroidWindowChanged ();
+			break;
+		case SDL_APP_LOWMEMORY:
+			Sys_Printf ("Android: low memory\n");
+			break;
+		case SDL_APP_TERMINATING:
+			Sys_Printf ("Android: terminating\n");
+			Host_WriteConfiguration ();
+			Android_SetRunning (0);
+			break;
+		default:
+			break;
+		}
+#endif
 		switch (event.type)
 		{
 		case SDL_WINDOWEVENT:
@@ -889,6 +935,7 @@ void IN_SendKeyEvents (void)
 			{
 				vid.width = event.window.data1;
 				vid.height = event.window.data2;
+				Sys_Printf ("Window size: %dx%d\n", vid.width, vid.height);
 				vid.restart_next_frame = true;
 				Cvar_FindVar ("scr_conscale")->callback (NULL);
 			}
@@ -987,4 +1034,7 @@ void IN_SendKeyEvents (void)
 			break;
 		}
 	}
+#ifdef HAVE_TOUCH_CONTROLS
+	AndroidTouch_Frame ();
+#endif
 }

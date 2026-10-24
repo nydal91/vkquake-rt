@@ -130,7 +130,9 @@ extern int r_trace_line_cache_counter;
 #endif
 
 #define MAX_BATCH_INDICES 65536
+#ifndef MAX_BATCH_VERTS
 #define MAX_BATCH_VERTS   8196
+#endif
 #define NUM_WORLD_CBX     6
 #define NUM_ENTITIES_CBX  6
 
@@ -167,6 +169,9 @@ typedef struct cb_context_s
 	RgVertex *batch_verts;
 	uint32_t *batch_indices;
 	int       batch_verts_count;
+	// the first surface in the batch: names the batch's geometry (unique ID),
+	// as each surface is in exactly one batch
+	const struct msurface_s *batch_first_surf;
 	int       batch_indices_count;
 } cb_context_t;
 
